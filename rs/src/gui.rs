@@ -1,0 +1,453 @@
+//! YBB 图形界面。
+//!
+//! 布局参照原版 MBB：标题 / 选卡队列 / 开始停止 / 运行日志。
+//! 视觉走低饱和暖白纸感，边框和圆角都收着来，避免刺眼的纯黑纯白。
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+
+use eframe::egui;
+use egui::{
+    Align, Color32, Rounding, FontData, FontDefinitions, FontFamily, Layout, Margin, RichText,
+    Stroke,
+};
+
+use ybb::engine::{self, Config, Level, Msg};
+use ybb::input::InputMode;
+use ybb::queue::parse_queue;
+
+const BG: Color32 = Color32::from_rgb(0xFA, 0xF8, 0xF4);
+const CARD: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+const LINE: Color32 = Color32::from_rgb(0xE8, 0xE3, 0xDA);
+const INK: Color32 = Color32::from_rgb(0x33, 0x31, 0x2E);
+const SUB: Color32 = Color32::from_rgb(0x8A, 0x85, 0x7D);
+const ACCENT: Color32 = Color32::from_rgb(0x5F, 0x84, 0x8C);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(0xE7, 0xEF, 0xF0);
+const OKC: Color32 = Color32::from_rgb(0x64, 0x8A, 0x6C);
+const WARN: Color32 = Color32::from_rgb(0xA8, 0x7F, 0x42);
+const ERRC: Color32 = Color32::from_rgb(0xAE, 0x5E, 0x45);
+const LOG_BG: Color32 = Color32::from_rgb(0xFB, 0xF9, 0xF5);
+
+/// 把编进二进制里的 PNG 解成 egui 需要的形式，用作窗口/任务栏图标
+fn load_icon() -> std::sync::Arc<egui::IconData> {
+    let bytes = include_bytes!("../assets/app256.png");
+    match image::load_from_memory(bytes) {
+        Ok(img) => {
+            let img = img.to_rgba8();
+            let (w, h) = img.dimensions();
+            std::sync::Arc::new(egui::IconData {
+                rgba: img.into_raw(),
+                width: w,
+                height: h,
+            })
+        }
+        Err(_) => std::sync::Arc::new(egui::IconData {
+            rgba: vec![0; 4],
+            width: 1,
+            height: 1,
+        }),
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_icon(load_icon())
+            .with_inner_size([372.0, 660.0])
+            .with_min_inner_size([340.0, 600.0])
+            .with_position([60.0, 30.0])
+            .with_title("YBB · 杯杯倒满 地铁自动选卡"),
+        persist_window: false,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "YBB",
+        opts,
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+    )
+}
+
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    for path in [
+        "C:/Windows/Fonts/Deng.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert("cjk".to_owned(), FontData::from_owned(bytes).into());
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .insert(0, "cjk".to_owned());
+            fonts
+                .families
+                .entry(FontFamily::Monospace)
+                .or_default()
+                .push("cjk".to_owned());
+            break;
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn setup_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals = egui::Visuals::light();
+    style.visuals.panel_fill = BG;
+    style.visuals.window_fill = BG;
+    style.visuals.extreme_bg_color = CARD;
+    style.visuals.faint_bg_color = LOG_BG;
+    style.visuals.override_text_color = Some(INK);
+    style.visuals.selection.bg_fill = ACCENT_SOFT;
+    style.visuals.selection.stroke = Stroke::new(1.0f32, ACCENT);
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(14.0, 7.0);
+    ctx.set_style(style);
+}
+
+fn card_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(CARD)
+        .stroke(Stroke::new(1.0f32, LINE))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(Margin::same(14.0))
+}
+
+fn section_title(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .size(13.0)
+            .color(SUB)
+            .strong(),
+    );
+    ui.add_space(2.0);
+}
+
+struct LogLine {
+    level: Level,
+    text: String,
+}
+
+struct App {
+    ctx: egui::Context,
+    queue_text: String,
+    log: Vec<LogLine>,
+    status: String,
+    progress: Option<(usize, usize, String)>,
+    running: bool,
+    rx: Option<mpsc::Receiver<Msg>>,
+    stop: Arc<AtomicBool>,
+    go: bool,
+    input_mode: InputMode,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        setup_fonts(&cc.egui_ctx);
+        setup_style(&cc.egui_ctx);
+
+        let queue_text = std::fs::read_to_string("cards.txt")
+            .map(|s| {
+                s.lines()
+                    .filter(|l| !l.trim_start().starts_with('#'))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        Self {
+            ctx: cc.egui_ctx.clone(),
+            queue_text,
+            log: Vec::new(),
+            status: "待机".into(),
+            progress: None,
+            running: false,
+            rx: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            go: true,
+            input_mode: InputMode::Keyboard,
+        }
+    }
+
+    fn rounds(&self) -> usize {
+        parse_queue(&self.queue_text).len()
+    }
+
+    fn push(&mut self, level: Level, text: String) {
+        self.log.push(LogLine { level, text });
+        if self.log.len() > 3000 {
+            self.log.drain(0..800);
+        }
+    }
+
+    fn start(&mut self) {
+        if self.running {
+            return;
+        }
+        let queue = parse_queue(&self.queue_text);
+        if queue.is_empty() {
+            self.push(Level::Err, "队列是空的，先把卡名贴进来".into());
+            return;
+        }
+        let body = format!("# 由 YBB 自动保存\n{}\n", queue.join("→"));
+        let _ = std::fs::write("cards.txt", body);
+
+        self.log.clear();
+        self.progress = None;
+        self.running = true;
+        self.stop = Arc::new(AtomicBool::new(false));
+        self.status = if self.go { "运行中".into() } else { "空跑中".into() };
+
+        let (tx, rx) = mpsc::channel::<Msg>();
+        self.rx = Some(rx);
+
+        let cfg = Config {
+            queue,
+            go: self.go,
+            max_reroll: 12,
+            use_interception: true,
+            input: self.input_mode,
+        };
+        let stop = self.stop.clone();
+        let ctx = self.ctx.clone();
+
+        std::thread::spawn(move || {
+            engine::run(
+                cfg,
+                move |m| {
+                    let _ = tx.send(m);
+                    ctx.request_repaint();
+                },
+                stop,
+            );
+        });
+    }
+
+    fn poll(&mut self) {
+        let mut batch: Vec<Msg> = Vec::new();
+        if let Some(rx) = &self.rx {
+            while let Ok(m) = rx.try_recv() {
+                batch.push(m);
+            }
+        }
+        for m in batch {
+            match m {
+                Msg::Log(lv, s) => self.push(lv, s),
+                Msg::Progress(a, b, t) => self.progress = Some((a, b, t)),
+                Msg::Done(r) => {
+                    self.running = false;
+                    match r {
+                        Ok(()) => {
+                            self.status = "完成".into();
+                            self.push(Level::Ok, "── 全部完成 ──".into());
+                        }
+                        Err(e) => {
+                            self.status = "已停止".into();
+                            self.push(Level::Err, format!("── {e} ──"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_header(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("YBB").size(26.0).strong().color(ACCENT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new("v1.0").size(10.5).color(SUB));
+            });
+        });
+        ui.label(
+            RichText::new("杯杯倒满 · 地铁自动选卡")
+                .size(13.0)
+                .color(INK),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("点「开始」后自动切到游戏；按不动就点一下游戏画面")
+                .size(10.5)
+                .color(SUB),
+        );
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll();
+
+        egui::TopBottomPanel::bottom("footer")
+            .frame(
+                egui::Frame::none()
+                    .fill(BG)
+                    .inner_margin(Margin::symmetric(14.0, 6.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("作者  歪歪子").size(10.5).color(SUB));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("1443423104@qq.com")
+                                .size(10.5)
+                                .color(Color32::from_rgb(0xA6, 0xA0, 0x96)),
+                        );
+                    });
+                });
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BG).inner_margin(Margin::same(14.0)))
+            .show(ctx, |ui| {
+                self.draw_header(ui);
+                ui.add_space(10.0);
+
+                // ---- 选卡队列 ----
+                section_title(ui, "选卡队列");
+                card_frame().show(ui, |ui| {
+                    // 竖屏下必须显式限宽，否则 desired_width(INFINITY) 会把内容撑出窗口
+                    let w = ui.available_width();
+                    egui::ScrollArea::vertical()
+                        .id_salt("queue")
+                        .max_height(168.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_max_width(w);
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.queue_text)
+                                    .desired_rows(3)
+                                    .desired_width(w)
+                                    .font(egui::FontId::proportional(22.0))
+                                    .frame(false)
+                                    .hint_text("把卡名按顺序贴进来"),
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let n = self.rounds();
+                        egui::Frame::none()
+                            .fill(ACCENT_SOFT)
+                            .rounding(Rounding::same(20.0))
+                            .inner_margin(Margin::symmetric(12.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!("共 {n} 轮")).size(14.0).color(ACCENT),
+                                );
+                            });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new("自动存入").size(9.0).color(SUB));
+                        });
+                    });
+                });
+
+                ui.add_space(12.0);
+
+                // ---- 按钮（竖屏一行放得下三个）----
+                ui.horizontal(|ui| {
+                    let can = !self.running && !self.queue_text.trim().is_empty();
+
+                    let start_btn = egui::Button::new(
+                        RichText::new("开始").size(14.0).color(Color32::WHITE).strong(),
+                    )
+                    .fill(if can { ACCENT } else { Color32::from_rgb(0xC5, 0xCB, 0xCC) })
+                    .rounding(Rounding::same(8.0))
+                    .min_size(egui::vec2(96.0, 34.0));
+                    if ui.add_enabled(can, start_btn).clicked() {
+                        self.go = true;
+                        self.start();
+                    }
+
+                    let dry_btn = egui::Button::new(RichText::new("空跑").size(14.0).color(ACCENT))
+                        .fill(CARD)
+                        .stroke(Stroke::new(1.0f32, LINE))
+                        .rounding(Rounding::same(8.0))
+                        .min_size(egui::vec2(70.0, 34.0));
+                    if ui.add_enabled(can, dry_btn).clicked() {
+                        self.go = false;
+                        self.start();
+                    }
+
+                    let stop_btn = egui::Button::new(RichText::new("停止").size(14.0).color(ERRC))
+                        .fill(CARD)
+                        .stroke(Stroke::new(1.0f32, LINE))
+                        .rounding(Rounding::same(8.0))
+                        .min_size(egui::vec2(70.0, 34.0));
+                    if ui.add_enabled(self.running, stop_btn).clicked() {
+                        self.stop.store(true, Ordering::SeqCst);
+                        self.status = "正在停止 ...".into();
+                    }
+                });
+
+                // ---- 输入方式 ----
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("输入").size(11.5).color(SUB));
+                    ui.add_enabled_ui(!self.running, |ui| {
+                        ui.selectable_value(&mut self.input_mode, InputMode::Keyboard, "键盘");
+                        ui.selectable_value(&mut self.input_mode, InputMode::Gamepad, "手柄")
+                            .on_hover_text(
+                                "创建虚拟 Xbox360 手柄；需要管理员运行，且实体手柄不能占 1P",
+                            );
+                    });
+                });
+
+                // ---- 状态 ----
+                let status_text = match &self.progress {
+                    Some((a, b, t)) if self.running => {
+                        format!("{} · {a}/{b} · {t}", self.status)
+                    }
+                    _ => self.status.clone(),
+                };
+                ui.label(RichText::new(status_text).size(11.5).color(SUB));
+
+                ui.add_space(10.0);
+
+                // ---- 日志 ----
+                section_title(ui, "运行日志");
+                egui::Frame::none()
+                    .fill(LOG_BG)
+                    .stroke(Stroke::new(1.0f32, LINE))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(Margin::same(10.0))
+                    .show(ui, |ui| {
+                        let h = (ui.available_height() - 6.0).max(120.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("log")
+                            .stick_to_bottom(true)
+                            .max_height(h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.log.is_empty() {
+                                    ui.label(
+                                        RichText::new("日志会出现在这里")
+                                            .size(12.0)
+                                            .color(Color32::from_rgb(0xB8, 0xB2, 0xA8)),
+                                    );
+                                }
+                                for l in &self.log {
+                                    let (color, mark) = match l.level {
+                                        Level::Info => (SUB, "·"),
+                                        Level::Step => (INK, "›"),
+                                        Level::Ok => (OKC, "✓"),
+                                        Level::Warn => (WARN, "!"),
+                                        Level::Err => (ERRC, "×"),
+                                    };
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 5.0;
+                                        ui.label(RichText::new(mark).size(12.0).color(color));
+                                        ui.label(RichText::new(&l.text).size(12.5).color(color));
+                                    });
+                                }
+                            });
+                    });
+            });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
