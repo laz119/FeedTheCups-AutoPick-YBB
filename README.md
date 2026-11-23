@@ -6,7 +6,7 @@
 
 **选一张卡不到 1 秒，比手动快 3 倍** · 绿色免安装 · 支持自动重抽
 
-[中文](README.md) · [English](README.en.md) · [下载](#直接使用(运行这三步即可使用)) · [License](LICENSE)
+[中文](README.md) · [English](README.en.md) · [下载](../../releases) · [License](LICENSE)
 
 </div>
 
