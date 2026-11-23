@@ -29,6 +29,58 @@ const OKC: Color32 = Color32::from_rgb(0x64, 0x8A, 0x6C);
 const WARN: Color32 = Color32::from_rgb(0xA8, 0x7F, 0x42);
 const ERRC: Color32 = Color32::from_rgb(0xAE, 0x5E, 0x45);
 const LOG_BG: Color32 = Color32::from_rgb(0xFB, 0xF9, 0xF5);
+const GITHUB_URL: &str = "https://github.com/laz119/FeedTheCups-AutoPick-YBB/tree/main";
+
+/// 用系统默认浏览器打开链接
+fn open_url(url: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    let op = wide("open");
+    let file = wide(url);
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// 赞赏码：编进二进制，绿色版不依赖外部文件
+fn load_sponsor(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let bytes = include_bytes!("../assets/sponsor.png");
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let color = egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        img.as_raw(),
+    );
+    Some(ctx.load_texture("sponsor", color, egui::TextureOptions::LINEAR))
+}
+
+/// 最后两轮提醒：响两下
+fn beep_twice() {
+    std::thread::spawn(|| {
+        use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
+        use windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
+        unsafe {
+            MessageBeep(MB_ICONASTERISK);
+            std::thread::sleep(std::time::Duration::from_millis(260));
+            MessageBeep(MB_ICONASTERISK);
+        }
+    });
+}
 
 /// 把编进二进制里的 PNG 解成 egui 需要的形式，用作窗口/任务栏图标
 fn load_icon() -> std::sync::Arc<egui::IconData> {
@@ -108,6 +160,9 @@ fn setup_style(ctx: &egui::Context) {
     style.visuals.selection.stroke = Stroke::new(1.0f32, ACCENT);
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(14.0, 7.0);
+    // 赞赏码悬停要跟手：默认 0.5s 延迟太慢了
+    style.interaction.tooltip_delay = 0.0;
+    style.interaction.tooltip_grace_time = 0.0;
     ctx.set_style(style);
 }
 
@@ -145,6 +200,8 @@ struct App {
     stop: Arc<AtomicBool>,
     go: bool,
     input_mode: InputMode,
+    sponsor: Option<egui::TextureHandle>,
+    end_warned: bool,
 }
 
 impl App {
@@ -172,6 +229,8 @@ impl App {
             stop: Arc::new(AtomicBool::new(false)),
             go: true,
             input_mode: InputMode::Keyboard,
+            sponsor: load_sponsor(&cc.egui_ctx),
+            end_warned: false,
         }
     }
 
@@ -202,6 +261,7 @@ impl App {
         self.progress = None;
         self.running = true;
         self.stop = Arc::new(AtomicBool::new(false));
+        self.end_warned = false;
         self.status = if self.go { "运行中".into() } else { "空跑中".into() };
 
         let (tx, rx) = mpsc::channel::<Msg>();
@@ -239,7 +299,15 @@ impl App {
         for m in batch {
             match m {
                 Msg::Log(lv, s) => self.push(lv, s),
-                Msg::Progress(a, b, t) => self.progress = Some((a, b, t)),
+                Msg::Progress(a, b, t) => {
+                    // 进入最后一轮 = 前面都选完了，提醒快结束
+                    if a == b && b > 1 && !self.end_warned {
+                        self.end_warned = true;
+                        self.push(Level::Warn, format!("只剩最后一轮（{a}/{b}）"));
+                        beep_twice();
+                    }
+                    self.progress = Some((a, b, t));
+                }
                 Msg::Done(r) => {
                     self.running = false;
                     match r {
@@ -276,6 +344,37 @@ impl App {
                 .color(SUB),
         );
     }
+
+    /// 页脚「支持作者」：悬停弹出赞赏码
+    fn support_button(&self, ui: &mut egui::Ui) {
+        ui.scope(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+            let btn = egui::Button::new(RichText::new("支持作者").size(10.5).color(ACCENT))
+                .fill(ACCENT_SOFT)
+                .stroke(Stroke::NONE)
+                .rounding(Rounding::same(9.0));
+            let resp = ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand);
+            if let Some(tex) = &self.sponsor {
+                resp.on_hover_ui(|ui| {
+                    ui.set_max_width(212.0);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(2.0);
+                        ui.image(egui::load::SizedTexture::new(
+                            tex.id(),
+                            egui::vec2(180.0, 180.0),
+                        ));
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("微信扫码 · 感谢支持")
+                                .size(10.0)
+                                .color(SUB),
+                        );
+                        ui.add_space(2.0);
+                    });
+                });
+            }
+        });
+    }
 }
 
 impl eframe::App for App {
@@ -291,6 +390,33 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("作者  歪歪子").size(10.5).color(SUB));
+                    ui.add_space(6.0);
+                    self.support_button(ui);
+                    ui.add_space(4.0);
+                    let gh = ui
+                        .add(
+                            egui::Label::new(RichText::new("GitHub").size(10.5).color(ACCENT))
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_ui(|ui| {
+                            ui.set_max_width(330.0);
+                            ui.label(
+                                RichText::new(GITHUB_URL)
+                                    .size(10.0)
+                                    .monospace()
+                                    .color(SUB),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new("点击用浏览器打开")
+                                    .size(9.5)
+                                    .color(ACCENT),
+                            );
+                        });
+                    if gh.clicked() {
+                        open_url(GITHUB_URL);
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new("1443423104@qq.com")
@@ -318,7 +444,7 @@ impl eframe::App for App {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_max_width(w);
-                            ui.add(
+                            let resp = ui.add(
                                 egui::TextEdit::multiline(&mut self.queue_text)
                                     .desired_rows(3)
                                     .desired_width(w)
@@ -326,18 +452,46 @@ impl eframe::App for App {
                                     .frame(false)
                                     .hint_text("把卡名按顺序贴进来"),
                             );
+                            // 改了队列就回到「共 N 轮」，不显示上一轮的旧进度
+                            if resp.changed() && !self.running {
+                                self.progress = None;
+                            }
                         });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        let n = self.rounds();
+                        let total_now = self.rounds();
+                        let (cur, total) = match &self.progress {
+                            Some((a, b, _)) => (Some(*a), *b),
+                            None => (None, total_now),
+                        };
                         egui::Frame::none()
                             .fill(ACCENT_SOFT)
                             .rounding(Rounding::same(20.0))
                             .inner_margin(Margin::symmetric(12.0, 4.0))
                             .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(format!("共 {n} 轮")).size(14.0).color(ACCENT),
-                                );
+                                if let Some(c) = cur {
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        ui.spacing_mut().item_spacing.x = 3.0;
+                                        ui.label(RichText::new("第").size(11.5).color(ACCENT));
+                                        ui.label(
+                                            RichText::new(c.to_string())
+                                                .size(16.0)
+                                                .strong()
+                                                .color(ACCENT),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("/ {total} 轮"))
+                                                .size(11.5)
+                                                .color(ACCENT),
+                                        );
+                                    });
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!("共 {total} 轮"))
+                                            .size(14.0)
+                                            .color(ACCENT),
+                                    );
+                                }
                             });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(RichText::new("自动存入").size(9.0).color(SUB));
@@ -362,16 +516,6 @@ impl eframe::App for App {
                         self.start();
                     }
 
-                    let dry_btn = egui::Button::new(RichText::new("空跑").size(14.0).color(ACCENT))
-                        .fill(CARD)
-                        .stroke(Stroke::new(1.0f32, LINE))
-                        .rounding(Rounding::same(8.0))
-                        .min_size(egui::vec2(70.0, 34.0));
-                    if ui.add_enabled(can, dry_btn).clicked() {
-                        self.go = false;
-                        self.start();
-                    }
-
                     let stop_btn = egui::Button::new(RichText::new("停止").size(14.0).color(ERRC))
                         .fill(CARD)
                         .stroke(Stroke::new(1.0f32, LINE))
@@ -380,6 +524,16 @@ impl eframe::App for App {
                     if ui.add_enabled(self.running, stop_btn).clicked() {
                         self.stop.store(true, Ordering::SeqCst);
                         self.status = "正在停止 ...".into();
+                    }
+
+                    let dry_btn = egui::Button::new(RichText::new("空跑").size(14.0).color(ACCENT))
+                        .fill(CARD)
+                        .stroke(Stroke::new(1.0f32, LINE))
+                        .rounding(Rounding::same(8.0))
+                        .min_size(egui::vec2(70.0, 34.0));
+                    if ui.add_enabled(can, dry_btn).clicked() {
+                        self.go = false;
+                        self.start();
                     }
                 });
 

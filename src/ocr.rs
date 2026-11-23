@@ -156,7 +156,9 @@ impl Tasker {
     }
 
     /// `only_rec = true` 时跳过文字检测模型，直接在给定 ROI 上跑识别。
-    /// 我们的 ROI 是写死的卡名框，本来就不需要检测，这一步通常能省掉一半时间。
+    ///
+    /// 送进 MAA 之前先把 ROI 从整帧里裁出来：`SetRawData` 是整块内存拷贝，
+    /// 传 1920×1080 全图每次约 6MB，三张卡一轮就是 18MB；裁成卡名框后只剩几百 KB。
     pub fn ocr_roi_ex(
         &self,
         img: &Image,
@@ -169,17 +171,42 @@ impl Tasker {
         let (x0, y0, x1, y1) = frac;
         let w = img.width as f64;
         let h = img.height as f64;
-        let x = (x0 * w) as i32;
-        let y = (y0 * h) as i32;
-        let rw = (x1 * w) as i32 - x;
-        let rh = (y1 * h) as i32 - y;
+        let mut x = (x0 * w) as i32;
+        let mut y = (y0 * h) as i32;
+        let mut rw = (x1 * w) as i32 - x;
+        let mut rh = (y1 * h) as i32 - y;
+        // 夹到图像范围内，越界直接报错而不是悄悄读脏内存
+        if x < 0 {
+            rw += x;
+            x = 0;
+        }
+        if y < 0 {
+            rh += y;
+            y = 0;
+        }
+        if x + rw > img.width as i32 {
+            rw = img.width as i32 - x;
+        }
+        if y + rh > img.height as i32 {
+            rh = img.height as i32 - y;
+        }
         if rw <= 0 || rh <= 0 {
             return Err("ROI 尺寸非法".into());
         }
 
-        // 与 JOCR 的默认参数一致
+        // 只拷 ROI 的像素行，避免整帧大拷贝
+        let ch = img.channels as usize;
+        let iw = img.width as usize;
+        let row_bytes = rw as usize * ch;
+        let mut roi_data = Vec::with_capacity(row_bytes * rh as usize);
+        for row in 0..rh as usize {
+            let start = ((y as usize + row) * iw + x as usize) * ch;
+            roi_data.extend_from_slice(&img.data[start..start + row_bytes]);
+        }
+
+        // 已经裁过图，roi 从 (0,0) 开始
         let json = format!(
-            r#"{{"expected":[],"roi":[{x},{y},{rw},{rh}],"roi_offset":[0,0,0,0],"threshold":0.3,"replace":[],"order_by":"Horizontal","index":0,"only_rec":{only_rec},"model":"","color_filter":""}}"#
+            r#"{{"expected":[],"roi":[0,0,{rw},{rh}],"roi_offset":[0,0,0,0],"threshold":0.3,"replace":[],"order_by":"Horizontal","index":0,"only_rec":{only_rec},"model":"","color_filter":""}}"#
         );
 
         unsafe {
@@ -190,9 +217,9 @@ impl Tasker {
             // 16 == OpenCV 的 CV_8UC3，与原版一致
             let ok = (self.maa.api.MaaImageBufferSetRawData)(
                 buf,
-                img.data.as_ptr() as *mut c_void,
-                img.width as i32,
-                img.height as i32,
+                roi_data.as_ptr() as *mut c_void,
+                rw,
+                rh,
                 16,
             );
             if ok == 0 {
@@ -209,7 +236,14 @@ impl Tasker {
             let out = if st != STATUS_SUCCEEDED {
                 Err(format!("识别失败，状态 {st}"))
             } else {
-                self.read_results(task_id)
+                // 结果框是相对裁剪图的，补回原图偏移，焦点比较还要用
+                self.read_results(task_id).map(|mut items| {
+                    for it in &mut items {
+                        it.box_[0] += x;
+                        it.box_[1] += y;
+                    }
+                    items
+                })
             };
             (self.maa.api.MaaImageBufferDestroy)(buf);
             out

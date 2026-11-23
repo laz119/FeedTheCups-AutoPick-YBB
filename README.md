@@ -15,7 +15,6 @@
 ## 简介
 
 按预设队列自动识别当前三张卡、移动焦点、确认，支持自动重抽。用画面侦测代替固定等待，动画一结束立刻继续，所以快。
-**手柄要用管理员模式开启**
 
 ## 特点
 
@@ -34,7 +33,7 @@
 - 游戏切成**窗口**或**无边框窗口**（独占全屏截不到画面）
 - 首次使用需安装 [Interception](https://github.com/oblitum/Interception) 键盘驱动，装完重启
 
-## 直接使用(运行这三步即可使用)
+## 直接使用
 
 到 [Releases](../../releases) 下载 `YBB-v1.0.zip`，解压后：
 
@@ -42,9 +41,7 @@
 2. 双击 `检查环境.bat` 确认各项就绪
 3. 双击 `YBB.exe`，贴入队列，点「开始」
 
-<img width="225" height="225" alt="image" src="https://github.com/user-attachments/assets/b649fc03-936c-4d15-bca0-f7358c1ef6e5" />
-
-## 从源码构建（非开发不需要这些）
+## 从源码构建
 
 除 Rust 工具链外还需要 MinGW（`windres` 用来嵌 exe 图标）。
 
@@ -76,8 +73,6 @@ cargo build --release
 
 默认按相对路径查找：当前目录、可执行文件所在目录、逐级父目录。
 如果想把资源放在别处，设环境变量 `YBB_ASSET_ROOT` 指向资源根目录即可。
-
-
 
 ## 命令行
 

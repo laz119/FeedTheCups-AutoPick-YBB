@@ -272,6 +272,24 @@ impl Injector for VigemInjector {
     }
 }
 
+/// 试一下虚拟手柄能不能用：能连上就销毁并返回 Ok，连不上返回原因。
+///
+/// 用于引擎在选择「手柄」时做预检——不满足条件就直接回退键盘，
+/// 而不是等到正式注入时才报错停住。
+pub fn try_gamepad(
+    maa: Arc<crate::maa::Maa>,
+    hwnd: *mut std::os::raw::c_void,
+    hold_ms: u64,
+) -> Result<(), String> {
+    let _ = (maa, hwnd);
+    let dir = crate::assets::find("_internal/maa/bin", "ViGEmClient.dll")
+        .ok_or("找不到 ViGEmClient.dll")?;
+    let dll = dir.join("ViGEmClient.dll");
+    // VigemInjector::new 会真的去连总线；成功就随 drop 释放，这里只验证可用性
+    let _pad = VigemInjector::new(dll, hold_ms)?;
+    Ok(())
+}
+
 /// 输入方式
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {

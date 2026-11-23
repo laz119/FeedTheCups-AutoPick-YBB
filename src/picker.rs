@@ -124,6 +124,8 @@ pub fn focus_index(
 
 /// 判稳阈值：静止画面实测差值 0.000，留一点余量给抗锯齿/编码噪声
 pub const STABLE_DIFF: f64 = 0.5;
+/// 重抽后判定「画面真的变了」的阈值
+pub const CHANGE_DIFF: f64 = 0.5;
 
 /// 一次「看」的结果
 pub struct Look {
@@ -133,26 +135,58 @@ pub struct Look {
     pub settle_ms: f64,
     /// 一共截了几帧
     pub shots: u32,
+    /// 判稳时的那一帧，重抽后用来判断画面有没有真的刷新
+    pub frame: Image,
+}
+
+/// 重抽后等画面失败的原因
+#[derive(Debug, Clone, Copy)]
+pub enum SettleFail {
+    /// 画面一直没变（多半是杯币不足）
+    NoChange,
+    /// 画面变了，但一直没稳定下来
+    Timeout,
+}
+
+fn is_cjk(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)
+}
+
+/// 翻牌动画中间会闪出「一E / 一a / 田」这种占位乱码，别把它当结果。
+/// 正常卡名至少有两个汉字；允许三张里有一张 OCR 抽风（比如把「气球」读成「球」）。
+fn plausible(cards: &[CardSlot]) -> bool {
+    cards
+        .iter()
+        .filter(|c| c.name.chars().filter(|ch| is_cjk(*ch)).count() >= 2)
+        .count()
+        >= 2
 }
 
 /// 判稳 + 读卡 + 判焦点。
 ///
-/// 和原版的区别：原版用**整屏**降采样帧差 + 0.06/0.08s 轮询，且要连续两帧都稳定；
-/// 这里只算**卡名带**的差、轮询 8ms、稳定帧直接就读。实测静止画面差值为 0.000，
-/// 所以正常情况下第一帧就能结束。
-pub fn settle_and_read(
+/// `baseline` 有值时表示这是「重抽之后」：除了要求连续两帧稳定，
+/// 还要求这一帧和重抽前明显不同，避免动画还没开始就把旧画面当成新画面。
+fn settle_core(
     ctrl: &crate::maa::Controller,
     t: &Tasker,
     tpl: Option<&crate::bubble::Bubble>,
     timeout_ms: u64,
-) -> Option<Look> {
+    baseline: Option<&Image>,
+    stable_needed: u32,
+) -> Result<Look, SettleFail> {
     let start = std::time::Instant::now();
     let mut prev: Option<Image> = None;
     let mut shots = 0u32;
+    let mut saw_change = false;
+    let mut stable_run = 0u32;
 
     loop {
         if start.elapsed().as_millis() as u64 > timeout_ms {
-            return None;
+            return Err(if baseline.is_some() && !saw_change {
+                SettleFail::NoChange
+            } else {
+                SettleFail::Timeout
+            });
         }
         let Ok(img) = ctrl.screencap() else {
             std::thread::sleep(std::time::Duration::from_millis(8));
@@ -163,27 +197,73 @@ pub fn settle_and_read(
         let rois = name_rois_abs(&img);
         let band = crate::fingerprint::name_band(&rois);
 
+        // 和重抽前那一帧比：必须真的变了
+        let differs = match baseline {
+            None => true,
+            Some(b) => {
+                let d = crate::fingerprint::band_diff(b, &img, band);
+                if d > CHANGE_DIFF {
+                    saw_change = true;
+                }
+                d > CHANGE_DIFF
+            }
+        };
+
         let stable = match &prev {
             None => false,
             Some(p) => crate::fingerprint::band_diff(p, &img, band) < STABLE_DIFF,
         };
-
         if stable {
+            stable_run += 1;
+        } else {
+            stable_run = 0;
+        }
+
+        if stable_run >= stable_needed && differs {
             let cards = read_cards(t, &img, true);
-            if cards.iter().all(|c| !c.is_empty()) {
+            let ok = cards.iter().all(|c| !c.is_empty())
+                && (baseline.is_none() || plausible(&cards));
+            if ok {
                 let focus = focus_auto(t, &img, &cards, tpl);
-                return Some(Look {
+                return Ok(Look {
                     cards,
                     focus,
                     settle_ms: start.elapsed().as_secs_f64() * 1000.0,
                     shots,
+                    frame: img,
                 });
+            }
+            // 动画中间的占位帧：重新攒稳定窗口，别急着读
+            if baseline.is_some() {
+                stable_run = 0;
             }
         }
 
         prev = Some(img);
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
+}
+
+/// 普通的一次「看」：只要求画面稳定。
+pub fn settle_and_read(
+    ctrl: &crate::maa::Controller,
+    t: &Tasker,
+    tpl: Option<&crate::bubble::Bubble>,
+    timeout_ms: u64,
+) -> Option<Look> {
+    settle_core(ctrl, t, tpl, timeout_ms, None, 1).ok()
+}
+
+/// 重抽之后的一次「看」：稳定 **且** 必须不同于 `baseline`。
+/// 稳定窗口取 3 次比较，避开翻牌动画中间的假稳定帧。
+pub fn settle_after_change(
+    ctrl: &crate::maa::Controller,
+    t: &Tasker,
+    tpl: Option<&crate::bubble::Bubble>,
+    baseline: &Image,
+    timeout_ms: u64,
+) -> Result<Look, SettleFail> {
+    settle_core(ctrl, t, tpl, timeout_ms, Some(baseline), 3)
 }
 
 /// 三个卡名 ROI 换成绝对像素

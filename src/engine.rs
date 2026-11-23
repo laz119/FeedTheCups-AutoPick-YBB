@@ -90,19 +90,34 @@ fn run_inner(
             format!("检测到实体手柄: {d}（杯杯倒满只认 1P）"),
         ),
     }
-    if cfg.input == input::InputMode::Gamepad {
+
+    // 决定实际用哪种输入。用户选「手柄」时，如果条件不满足就自动回退到键盘，
+    // 而不是硬报错让程序停在那——手柄方案在多数机器上本来就跑不起来。
+    let mut mode = cfg.input;
+    if mode == input::InputMode::Gamepad {
+        let mut reason: Option<String> = None;
+        // 1. 实体手柄占着 1P → 虚拟手柄只能拿到 2P+，游戏只认 1P，白搭
         if let Some(p) = crate::xinput::scan().into_iter().find(|p| p.slot == 0) {
+            reason = Some(format!(
+                "实体手柄正占着 1P{}，虚拟手柄会被排到 2P 以后，游戏只认 1P",
+                if p.active { "（而且它正在发输入）" } else { "" }
+            ));
+        }
+        // 2. 没有管理员权限 → ViGEmBus 打不开。先试试能不能连上，连不上就回退。
+        if reason.is_none() {
+            if let Err(e) = input::try_gamepad(maa.clone(), win.hwnd, 60) {
+                reason = Some(e);
+            }
+        }
+        if let Some(r) = reason {
             log(
                 Level::Warn,
-                format!(
-                    "实体手柄正占着 1P{}，虚拟手柄会被排到 2P 以后，而游戏只认 1P —— \
-                     请关掉/断开实体手柄，或改用「键盘」",
-                    if p.active { "（而且它正在发输入）" } else { "" }
-                ),
+                format!("手柄模式不可用（{r}），已自动改用键盘"),
             );
+            mode = input::InputMode::Keyboard;
         }
     }
-    if cfg.input == input::InputMode::Keyboard {
+    if mode == input::InputMode::Keyboard {
         if let Some(p) = crate::xinput::scan().into_iter().find(|p| p.active) {
             log(
                 Level::Warn,
@@ -122,7 +137,7 @@ fn run_inner(
 
     let inj: Option<Box<dyn Injector>> = if cfg.go {
         let i = input::build_mode(
-            cfg.input,
+            mode,
             maa.clone(),
             win.hwnd,
             cfg.use_interception,
@@ -150,15 +165,27 @@ fn run_inner(
         let mut t_move = 0.0f64;
         let mut rerolls = 0u32;
 
+        let mut pending: Option<picker::Look> = None;
         let picked = loop {
             if stopped() {
                 return Err("已停止".into());
             }
-            let t_l = Instant::now();
-            let Some(look) = picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), 3000) else {
-                return Err("等不到稳定的选卡画面".into());
+            let look = match pending.take() {
+                Some(l) => {
+                    // 重抽后已经重新识别过，直接复用，别再读一遍
+                    t_look += l.settle_ms;
+                    l
+                }
+                None => {
+                    let t_l = Instant::now();
+                    let Some(l) = picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), 3000)
+                    else {
+                        return Err("等不到稳定的选卡画面".into());
+                    };
+                    t_look += t_l.elapsed().as_secs_f64() * 1000.0;
+                    l
+                }
             };
-            t_look += t_l.elapsed().as_secs_f64() * 1000.0;
 
             let shown = look
                 .cards
@@ -206,17 +233,34 @@ fn run_inner(
                     };
                     let t_rr = Instant::now();
                     inj.tap(input::Key::Reroll).map_err(|e| e.to_string())?;
-                    let band = crate::fingerprint::name_band(&picker::name_rois_abs(
-                        &ctrl.screencap().map_err(|e| e.to_string())?,
-                    ));
-                    if !picker::wait_changed(&ctrl, band, 0.5, 3500) {
-                        return Err("重抽后画面没变化（可能杯币不足）".into());
+                    // 重抽后直接进入「稳定 + 必须不同于重抽前」的识别，
+                    // 不再单独 wait_changed：动画没开始时会一直等，不会把旧画面当新画面。
+                    let baseline = look.frame;
+                    match picker::settle_after_change(
+                        &ctrl,
+                        &tasker,
+                        tpl.as_ref(),
+                        &baseline,
+                        3500,
+                    ) {
+                        Ok(l) => {
+                            log(
+                                Level::Info,
+                                format!(
+                                    "  重抽生效，重新识别用了 {:.0}ms",
+                                    t_rr.elapsed().as_secs_f64() * 1000.0
+                                ),
+                            );
+                            rerolls += 1;
+                            pending = Some(l);
+                        }
+                        Err(picker::SettleFail::NoChange) => {
+                            return Err("重抽后画面没变化（可能杯币不足）".into());
+                        }
+                        Err(picker::SettleFail::Timeout) => {
+                            return Err("重抽后等不到稳定画面".into());
+                        }
                     }
-                    log(
-                        Level::Info,
-                        format!("  重抽生效，等画面 {:.0}ms", t_rr.elapsed().as_secs_f64() * 1000.0),
-                    );
-                    rerolls += 1;
                 }
             }
         };
