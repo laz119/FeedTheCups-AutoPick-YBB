@@ -33,7 +33,7 @@
 - 游戏切成**窗口**或**无边框窗口**（独占全屏截不到画面）
 - 首次使用需安装 [Interception](https://github.com/oblitum/Interception) 键盘驱动，装完重启
 
-## 直接使用
+## 直接使用(运行这三步即可使用)
 
 到 [Releases](../../releases) 下载 `YBB-v1.0.zip`，解压后：
 
@@ -41,7 +41,11 @@
 2. 双击 `检查环境.bat` 确认各项就绪
 3. 双击 `YBB.exe`，贴入队列，点「开始」
 
-## 从源码构建
+
+<img width="225" height="225" alt="image" src="https://github.com/user-attachments/assets/b649fc03-936c-4d15-bca0-f7358c1ef6e5" />
+
+
+## 从源码构建（非开发不需要这些）
 
 除 Rust 工具链外还需要 MinGW（`windres` 用来嵌 exe 图标）。
 
