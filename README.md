@@ -31,7 +31,7 @@
 
 - Windows 10 / 11 x64
 - 游戏切成**窗口**或**无边框窗口**（独占全屏截不到画面）
-- 首次使用需安装 [Interception](https://github.com/oblitum/Interception) 键盘驱动，装完重启
+- 首次使用需安装 [Interception](https://github.com/oblitum/Interception) 键盘驱动，装完重启（驱动已经打包进releases  直接阅读下一节即可 无需单独下载）
 
 ## 直接使用(运行这三步即可使用)
 
