@@ -41,13 +41,31 @@ pub fn score(target: &str, cand: &str) -> f64 {
     if target == cand {
         return 1.0;
     }
-    if cand.contains(target) {
-        return 0.95;
-    }
-    if target.contains(cand) {
+    // 「升级版」只差一个 +，是同一张卡
+    if base(target) == base(cand) {
         return 0.85;
     }
+    // 候选比目标多认了字：最多容忍 1 个多余字符
+    if cand.contains(target) {
+        let extra = cand.chars().count() - target.chars().count();
+        return if extra <= 1 { 0.95 } else { 0.0 };
+    }
+    // 目标包含候选 = 识别少认了字；除了上面的 + 变体，一律不接受。
+    // 这正是「气球」被「球」命中的原因，必须直接拒绝。
+    if target.contains(cand) {
+        return 0.0;
+    }
+    // 候选比目标短，或者长度差太大，都直接拒绝；宁可漏选也不选错。
+    let tl = target.chars().count();
+    let cl = cand.chars().count();
+    if cl < tl || tl.min(cl) * 2 < tl.max(cl) {
+        return 0.0;
+    }
     ratio(target, cand)
+}
+
+fn base(s: &str) -> &str {
+    s.strip_suffix('+').unwrap_or(s)
 }
 
 /// `difflib.SequenceMatcher(None, a, b).ratio()` 的等价实现：`2*M/T`，
@@ -136,6 +154,15 @@ mod tests {
         // 「气球」与「气球+」必须能匹配上，否则会把升级版当成不存在
         assert!(score("气球+", "气球") >= 0.55);
         assert!(score("气球", "气球+") >= 0.55);
+    }
+
+    #[test]
+    fn partial_ocr_is_rejected() {
+        // 气球 少认成 球，不能靠 target.contains(cand) 混过去
+        assert!(score("气球", "球") < 0.55);
+        assert!(score("气球+", "球") < 0.55);
+        assert!(score("零花钱", "零钱") < 0.55);
+        assert!(score("内卷饭碗", "内卷") < 0.55);
     }
 
     #[test]

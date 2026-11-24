@@ -14,6 +14,7 @@ use crate::maa::{self, Controller, Image, Maa};
 use crate::ocr::{Resource, Tasker};
 use crate::picker;
 use crate::score::score;
+use crate::tuning::Tuning;
 use crate::win;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25,10 +26,24 @@ pub enum Level {
     Err,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Idle,
+    WaitingScreen,
+    Reading,
+    MovingFocus,
+    Confirming,
+    WaitingNext,
+    Rerolling,
+    Done,
+}
+
 pub enum Msg {
     Log(Level, String),
     /// 当前轮次 / 总轮数 / 目标卡
     Progress(usize, usize, String),
+    /// 当前阶段，用于 GUI 状态条
+    Phase(Phase),
     Done(Result<(), String>),
 }
 
@@ -57,6 +72,7 @@ fn run_inner(
 ) -> Result<(), String> {
     let log = |lv: Level, s: String| emit(Msg::Log(lv, s));
     let stopped = || stop.load(Ordering::SeqCst);
+    let tune = Tuning::from_env();
 
     let maa_dir = assets::maa_bin()?;
     let model_dir = assets::ocr_model()?;
@@ -77,7 +93,7 @@ fn run_inner(
     )
     .map_err(|e| e.to_string())?;
     ctrl.connect().map_err(|e| e.to_string())?;
-    ctrl.set_screenshot_long_side(1920);
+    ctrl.set_screenshot_long_side(tune.screenshot_long_side as i32);
 
     let tpl = Bubble::load("focus_template.png");
     if tpl.is_none() {
@@ -143,7 +159,7 @@ fn run_inner(
             maa.clone(),
             win.hwnd,
             cfg.use_interception,
-            60,
+            tune.hold_ms,
         )?;
         log(Level::Info, format!("输入方式: {}", i.name()));
         Some(i)
@@ -151,18 +167,48 @@ fn run_inner(
         None
     };
 
+    // 卡名完整但焦点气泡被介绍面板挡住时，按 S 两次清掉介绍。
+    let clear_cards = || {
+        if let Some(inj) = &inj {
+            log(Level::Warn, "  焦点气泡被挡，按 S 两次清介绍".into());
+            let _ = inj.tap(input::Key::Down);
+            std::thread::sleep(std::time::Duration::from_millis(45));
+            let _ = inj.tap(input::Key::Down);
+            std::thread::sleep(std::time::Duration::from_millis(160));
+        }
+    };
+
+    // ORT 批量识别；失败/手动关闭时回退 MAA
+    let use_maa = std::env::var("YBB_OCR")
+        .map(|v| v.eq_ignore_ascii_case("maa"))
+        .unwrap_or(false);
+    let ort = if use_maa {
+        log(Level::Info, "OCR: MAA（YBB_OCR=maa）".into());
+        None
+    } else {
+        match crate::ort_ocr::OrtOcr::from_assets(tune.ort_threads) {
+            Ok(o) => {
+                log(Level::Info, "OCR: ONNX Runtime 三张批量（4 线程）".into());
+                Some(o)
+            }
+            Err(e) => {
+                log(Level::Warn, format!("ORT 不可用，回退 MAA：{e}"));
+                None
+            }
+        }
+    };
+
     // 预热一次，避免首轮把模型初始化的时间算进去
-    let _ = picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), 3000);
+    let _ = picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), ort.as_ref(), Some(&clear_cards), tune.settle_timeout_ms);
 
     let total = cfg.queue.len();
     if cfg.start_index >= total {
         return Err("队列里没有可继续的轮次".into());
     }
-    // 实验开关：复用确认后的变化帧，省一次截图；默认开启，设 YBB_FRAME_REUSE=0 可回退
-    let frame_reuse = std::env::var("YBB_FRAME_REUSE")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    let frame_reuse = tune.frame_reuse;
+    let batch_taps = tune.batch_taps;
     let mut seed: Option<Image> = None;
+    let mut prev_names: Vec<String> = Vec::new();
     let t_all = Instant::now();
 
     for (i, target) in cfg.queue.iter().enumerate().skip(cfg.start_index) {
@@ -170,6 +216,8 @@ fn run_inner(
             return Err("已停止".into());
         }
         emit(Msg::Progress(i + 1, total, target.clone()));
+        emit(Msg::Phase(Phase::WaitingScreen));
+
         let t_round = Instant::now();
         let mut t_look = 0.0f64;
         let mut t_move = 0.0f64;
@@ -188,16 +236,53 @@ fn run_inner(
                 }
                 None => {
                     let t_l = Instant::now();
-                    let Some(l) = picker::settle_and_read_seeded(
-                        &ctrl,
-                        &tasker,
-                        tpl.as_ref(),
-                        3000,
-                        seed.take(),
-                    ) else {
-                        return Err("等不到稳定的选卡画面".into());
+                    let mut fails = 0u32;
+                    let mut pressed_s = false;
+                    let l = loop {
+                        let attempt = picker::settle_and_read_seeded(
+                            &ctrl,
+                            &tasker,
+                            tpl.as_ref(),
+                            ort.as_ref(),
+                            Some(&clear_cards),
+                            tune.settle_timeout_ms,
+                            seed.take(),
+                        );
+                        if let Some(l) = attempt {
+                            if picker::cards_ok(&l.cards) {
+                                // 卡名和上一轮完全一样 = 可能是翻牌动画旧帧，丢弃重读
+                                let cur: Vec<&str> = l.cards.iter().map(|c| c.name.as_str()).collect();
+                                let prev: Vec<&str> = prev_names.iter().map(|s| s.as_str()).collect();
+                                if cur != prev {
+                                    break l;
+                                }
+                                log(Level::Warn, "  卡名和上一轮相同，重新截图识别".into());
+                                continue;
+                            }
+                        }
+                        fails += 1;
+                        if !pressed_s && fails >= 2 {
+                            if let Some(inj) = &inj {
+                                log(
+                                    Level::Warn,
+                                    "  卡名不完整，重试后按 S 两次再读".into(),
+                                );
+                                inj.tap(input::Key::Down).map_err(|e| e.to_string())?;
+                                std::thread::sleep(std::time::Duration::from_millis(45));
+                                inj.tap(input::Key::Down).map_err(|e| e.to_string())?;
+                                std::thread::sleep(std::time::Duration::from_millis(160));
+                                pressed_s = true;
+                                fails = 0;
+                                continue;
+                            }
+                        }
+                        let limit = if pressed_s { 2 } else { 3 };
+                        if fails >= limit {
+                            return Err("卡名识别异常，重试后仍读不到三张卡".into());
+                        }
                     };
                     t_look += t_l.elapsed().as_secs_f64() * 1000.0;
+                    emit(Msg::Phase(Phase::Reading));
                     l
                 }
             };
@@ -238,7 +323,7 @@ fn run_inner(
                                 .into(),
                         );
                     };
-                    break (idx, f, look.cards.clone(), look.auto_layout);
+                    break (idx, f, look.cards.clone(), look.frame, look.auto_layout);
                 }
                 _ => {
                     log(Level::Step, format!("  当前没有 {target:?}  {shown}"));
@@ -261,9 +346,10 @@ fn run_inner(
                     }
                     let Some(inj) = &inj else {
                         log(Level::Warn, "  （空跑：本应重抽）".into());
-                        break (0, 0, look.cards.clone(), look.auto_layout);
+                        break (0, 0, look.cards.clone(), look.frame, look.auto_layout);
                     };
                     let t_rr = Instant::now();
+                    emit(Msg::Phase(Phase::Rerolling));
                     inj.tap(input::Key::Reroll).map_err(|e| e.to_string())?;
                     // 重抽后直接进入「稳定 + 必须不同于重抽前」的识别，
                     // 不再单独 wait_changed：动画没开始时会一直等，不会把旧画面当新画面。
@@ -272,10 +358,22 @@ fn run_inner(
                         &ctrl,
                         &tasker,
                         tpl.as_ref(),
+                        ort.as_ref(),
+                        Some(&clear_cards),
                         &baseline,
-                        3500,
+                        tune.reroll_timeout_ms,
                     ) {
                         Ok(l) => {
+                            let same = l
+                                .cards
+                                .iter()
+                                .map(|c| &c.name)
+                                .eq(look.cards.iter().map(|c| &c.name));
+                            if same {
+                                return Err(
+                                    "重抽后卡名没有变化，可能杯币不足或重抽没生效".into()
+                                );
+                            }
                             log(
                                 Level::Info,
                                 format!(
@@ -297,9 +395,10 @@ fn run_inner(
             }
         };
 
-        let (target_idx, mut focus, snapshot, auto_layout) = picked;
+        let (target_idx, mut focus, snapshot, frame, auto_layout) = picked;
 
         if let Some(inj) = &inj {
+            emit(Msg::Phase(Phase::MovingFocus));
             let mut guard = 0;
             while focus != target_idx && guard < 5 {
                 guard += 1;
@@ -313,6 +412,33 @@ fn run_inner(
                     std::thread::sleep(std::time::Duration::from_millis(120));
                 }
                 let prev = focus;
+                let dist = target_idx.abs_diff(focus);
+                if batch_taps && dist > 1 {
+                    for _ in 0..dist {
+                        inj.tap(key).map_err(|e| e.to_string())?;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    let t_bt = Instant::now();
+                    if let Some(f) = picker::wait_focus_target(
+                        &ctrl,
+                        &tasker,
+                        &snapshot,
+                        tpl.as_ref(),
+                        target_idx,
+                        tune.focus_timeout_ms,
+                    ) {
+                        focus = f;
+                        t_move += t_bt.elapsed().as_secs_f64() * 1000.0;
+                        log(Level::Info, format!("  连按 {dist} 格到第{}张，用了 {:.0}ms", focus + 1, t_bt.elapsed().as_secs_f64() * 1000.0));
+                        continue;
+                    }
+                    log(Level::Warn, "  连按没到目标，改回逐格".into());
+                    if let Ok(img) = ctrl.screencap() {
+                        if let Some(f) = picker::focus_auto(&tasker, &img, &snapshot, tpl.as_ref()) {
+                            focus = f;
+                        }
+                    }
+                }
                 let t_mv = Instant::now();
                 inj.tap(key).map_err(|e| e.to_string())?;
                 let next = if auto_layout {
@@ -322,7 +448,7 @@ fn run_inner(
                         &snapshot,
                         tpl.as_ref(),
                         prev,
-                        1500,
+                        tune.focus_timeout_ms,
                     )
                 } else {
                     picker::wait_focus_change(
@@ -331,7 +457,7 @@ fn run_inner(
                         &snapshot,
                         tpl.as_ref(),
                         prev,
-                        1500,
+                        tune.focus_timeout_ms,
                     )
                 };
                 match next {
@@ -357,14 +483,25 @@ fn run_inner(
             if !win::is_foreground(win.hwnd) {
                 win::force_foreground(win.hwnd);
             }
+            emit(Msg::Phase(Phase::Confirming));
             inj.tap(input::Key::Confirm).map_err(|e| e.to_string())?;
         }
 
         if i + 1 < total {
-            let band = crate::fingerprint::name_band(&picker::name_rois_abs(
-                &ctrl.screencap().map_err(|e| e.to_string())?,
-            ));
-            let changed = picker::wait_changed(&ctrl, band, 1.0, 3500);
+            emit(Msg::Phase(Phase::WaitingNext));
+            // band 只取决于截图尺寸；直接用当前这帧算，别再为它截一次图。
+            let band = crate::fingerprint::name_band(&picker::name_rois_abs(&frame));
+            let mut changed = picker::wait_changed(&ctrl, band, &frame, 1.0, tune.settle_timeout_ms);
+            if changed.is_none() {
+                if let Some(inj) = &inj {
+                    log(Level::Warn, "  确认后画面没变，重试一次确认".into());
+                    inj.tap(input::Key::Confirm).map_err(|e| e.to_string())?;
+                    changed = picker::wait_changed(&ctrl, band, &frame, 1.0, tune.focus_timeout_ms.max(1000));
+                }
+            }
+            if changed.is_none() && inj.is_some() {
+                return Err("确认后画面没有变化，可能没选中或游戏卡住".into());
+            }
             let changed_ok = changed.is_some();
             if frame_reuse {
                 // 把变化帧留给下一轮判稳，省一次截图
@@ -372,6 +509,7 @@ fn run_inner(
             } else {
                 seed = None;
             }
+            prev_names = snapshot.iter().map(|c| c.name.clone()).collect();
             log(
                 Level::Ok,
                 format!(
@@ -395,6 +533,7 @@ fn run_inner(
         }
     }
 
+    emit(Msg::Phase(Phase::Done));
     log(
         Level::Ok,
         format!("全部 {total} 轮完成，总耗时 {:.1}s", t_all.elapsed().as_secs_f64()),
