@@ -60,12 +60,14 @@ fn main() {
         "learn" => learn_cmd(&args[1..]),
         "match" => match_cmd(&args[1..]),
         "ocr" => ocr_cmd(&args[1..]),
+        "scan" => scan_cmd(&args[1..]),
+        "autofocus" => autofocus_cmd(&args[1..]),
         "focus" => focus_cmd(&args[1..]),
         "focust" => focust_cmd(&args[1..]),
         "parse" => parse_cmd(&args[1..]),
         "selftest" => selftest(),
         "-V" | "--version" | "version" => {
-            println!("YBB v1.0 —— 杯杯倒满 地铁自动选卡");
+            println!("YBB v1.1 —— 杯杯倒满 地铁自动选卡");
             println!("作者: 歪歪子  <1443423104@qq.com>");
             println!("开源协议: MIT（可自由复制修改，保留版权声明即可）");
             println!("查看完整协议: ybb-cli.exe --license");
@@ -221,6 +223,7 @@ fn run_cmd(rest: &[String]) {
     };
     let cfg = ybb::engine::Config {
         queue,
+        start_index: 0,
         go,
         max_reroll,
         use_interception: use_icpt,
@@ -366,10 +369,20 @@ fn dry_cmd(rest: &[String]) {
 
     // 热身：截图 + 完整跑一次识别，把模型预热和缓存都喂满，之后才是稳态数字
     let _ = ctrl.screencap();
-    let _ = ybb::picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), 3000);
+    let warm = ybb::picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), 3000);
+    let seed = if std::env::var("YBB_FRAME_REUSE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+    {
+        warm.map(|l| l.frame)
+    } else {
+        None
+    };
 
     let t_all = Instant::now();
-    let Some(look) = ybb::picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), 3000) else {
+    let Some(look) =
+        ybb::picker::settle_and_read_seeded(&ctrl, &tasker, tpl.as_ref(), 3000, seed)
+    else {
         die("等不到稳定的选卡画面");
     };
     let t_total = t_all.elapsed().as_secs_f64() * 1000.0;
@@ -813,6 +826,55 @@ fn ocr_cmd(rest: &[String]) {
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
     std::process::exit(2);
+}
+
+/// 临时调试：对任意 ROI 做完整 OCR（带检测），看能不能自动找到卡名
+fn scan_cmd(rest: &[String]) {
+    let Some(path) = rest.iter().find(|a| !a.starts_with("--")) else {
+        die("用法: ybb-cli.exe scan <图片> [x0 y0 x1 y1]");
+    };
+    let nums: Vec<f64> = rest.iter().filter_map(|s| s.parse::<f64>().ok()).collect();
+    let roi = if nums.len() >= 4 {
+        (nums[0], nums[1], nums[2], nums[3])
+    } else {
+        (0.05, 0.25, 0.95, 0.85)
+    };
+    let (_maa, tasker) = init_ocr();
+    let img = ybb::maa::Image::load_bgr(path).unwrap_or_else(|e| die(&e));
+    println!("图像 {}x{}  ROI {:?}", img.width, img.height, roi);
+    match tasker.ocr_roi_ex(&img, roi, false) {
+        Ok(hits) => {
+            for h in hits {
+                println!("box={:?}  score={:.2}  {:?}", h.box_, h.score, h.text);
+            }
+        }
+        Err(e) => println!("失败: {e}"),
+    }
+}
+
+/// 临时调试：自动布局找卡 + 全局找焦点
+fn autofocus_cmd(rest: &[String]) {
+    let Some(path) = rest.iter().find(|a| !a.starts_with("--")) else {
+        die("用法: ybb-cli.exe autofocus <图片>");
+    };
+    let (_maa, tasker) = init_ocr();
+    let img = ybb::maa::Image::load_bgr(path).unwrap_or_else(|e| die(&e));
+    let tpl = ybb::bubble::Bubble::load("focus_template.png");
+
+    let t0 = Instant::now();
+    let cards = ybb::picker::read_cards_auto(&tasker, &img);
+    let t_cards = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let t0 = Instant::now();
+    let focus = ybb::picker::focus_auto_global(&tasker, &img, &cards, tpl.as_ref());
+    let t_focus = t0.elapsed().as_secs_f64() * 1000.0;
+
+    println!("图像 {}x{}  自动找卡 {:.0}ms  全局焦点 {:.0}ms", img.width, img.height, t_cards, t_focus);
+    for (i, c) in cards.iter().enumerate() {
+        let mark = if Some(i) == focus { "  ← 焦点" } else { "" };
+        println!("  第{}张  {:?}  box={:?}{}", i + 1, c.name, c.box_, mark);
+    }
+    println!("焦点: {:?}", focus.map(|i| i + 1));
 }
 
 /// 解析 `--ep cpu|directml|webgpu|auto`；没给就返回 None（用默认）

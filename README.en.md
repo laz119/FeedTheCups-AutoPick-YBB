@@ -1,128 +1,143 @@
-# Feed The Cups Auto-Picker (YBB)
+<div align="center">
 
-An automatic card picker for the "Metro" mode of *Feed The Cups* (杯杯倒满). Windows desktop app built with Rust + egui.
+# 🥤 Feed The Cups Auto Card Picker (YBB)
 
-It reads a preset queue, recognizes the three cards on screen, moves the focus, and confirms — with automatic reroll. Picks a card in under 1 second, roughly 3× faster than doing it by hand.
+Automatic card picker for the Metro mode of *Feed The Cups* · Windows desktop app · Rust + egui
 
-**[中文](README.md) · [English](README.en.md)**
+**Under 1 second per pick, 3× faster than manual** · Portable · Auto reroll
 
-## Features
+[中文](README.md) · [English](README.en.md) · [Download](#download) · [License](LICENSE)
 
-- **Fast**: no fixed sleep. Polls screen pixels every 8 ms and proceeds the moment the picture settles
-  - target already focused: ~0.6–0.9 s
-  - move 1 slot: ~0.85 s
-  - move 2 slots: ~1.2–1.5 s
-  - wait for new cards after reroll: ~0.2 s
-- **Template-matched focus detection**: 12 ms per result, ~20× faster than OCR, falls back to OCR automatically so it never picks wrong
-- **Portable**: no registry writes, no runtime install, move the folder anywhere
-- **Safe**: stops instead of guessing when focus can't be read, so it never misclicks
+</div>
+
+---
+
+## What it is
+
+YBB reads the three cards on screen, compares them with a preset queue, moves the focus and confirms the pick. If the target card is not there, it rerolls automatically. Instead of sleeping for a fixed time, it watches the screen and continues as soon as the animation settles.
+
+## Highlights
+
+- **Fast**: no fixed sleeps; the screen is polled every 8 ms and the next step starts as soon as it settles
+  - Target already focused: about 0.6–0.9 s
+  - One slot away: about 0.85 s
+  - Two slots away: about 1.2–1.5 s
+  - Each reroll: about 0.2 s for the new cards
+- **Template-based focus detection**: takes about 12 ms, roughly 20× faster than OCR; if the template fails it falls back to OCR instead of guessing
+- **Portable**: no registry writes, no runtime install, no background service — move the folder anywhere
+- **Safe by default**: if the focus cannot be read, it stops instead of pressing keys blindly
 
 ## Requirements
 
 - Windows 10 / 11 x64
-- Game in **windowed** or **borderless windowed** mode (exclusive fullscreen can't be captured)
-- First-time setup needs the [Interception](https://github.com/oblitum/Interception) keyboard driver, then reboot
+- The game must run in **Windowed** or **Borderless** mode (exclusive fullscreen cannot be captured)
+- Install the [Interception](https://github.com/oblitum/Interception) keyboard driver once, then reboot. The driver is already bundled in Releases — just follow the next section, no separate download needed.
 
-## Quick Start
+<a id="download"></a>
 
-Download `YBB-v1.0.zip` from [Releases](../../releases), extract, then:
+## Getting started (three steps)
 
-1. Double-click `安装驱动.bat` (accept UAC), reboot
-2. Double-click `检查环境.bat` to verify everything is ready
-3. Double-click `YBB.exe`, paste your queue, click "开始" (Start)
+Download `YBB-v1.1.zip` from [Releases](../../releases), extract it, then:
 
-Full guide: `使用说明.txt` inside the archive.
+1. Run `安装驱动.bat` (click "Yes" on the UAC prompt) and reboot.
+2. Run `检查环境.bat` and confirm everything is ready.
+3. Run `YBB.exe`, paste your card queue and press **开始** (Start).
 
-## Build from Source
 
-Requires the Rust toolchain plus MinGW (`windres` is used to embed the exe icon).
+<img width="225" height="225" alt="image" src="https://github.com/user-attachments/assets/b649fc03-936c-4d15-bca0-f7358c1ef6e5" />
+
+
+## Build from source (not needed for normal use)
+
+Besides the Rust toolchain you need MinGW (`windres` is used to embed the exe icon).
 
 ```bash
 cd rs
 cargo build --release
 ```
 
-Output in `target/release/`: `YBB.exe` (GUI), `ybb-cli.exe` (CLI).
+Outputs in `target/release/`: `YBB.exe` (GUI) and `ybb-cli.exe` (CLI).
 
-> If the source path contains non-ASCII characters or spaces, MinGW's gcc can't read
-> the path at link time. Set a pure-ASCII target dir in `rs/.cargo/config.toml`:
+> If the source path contains non-ASCII characters or spaces, MinGW's gcc may fail at link time.
+> Point Cargo at an ASCII-only target directory in `rs/.cargo/config.toml`:
 >
 > ```toml
 > [build]
 > target-dir = "D:/rust-target"
 > ```
 
-**Note**: runtime dependencies are not in the repo. A build needs these alongside it:
+**Note**: the repository does not include runtime dependencies. A built binary needs:
 
 | Path | Contents |
 |---|---|
-| `_internal/maa/bin/` | [MaaFramework](https://github.com/MaaXYZ/MaaFramework) DLLs (screencap, OCR inference) |
+| `_internal/maa/bin/` | [MaaFramework](https://github.com/MaaXYZ/MaaFramework) DLLs (capture and OCR) |
 | `model/ocr/` | PP-OCR model |
-| `interception.dll` | keyboard injection library (from the Interception release) |
-| `focus_template.png` | focus bubble template |
+| `interception.dll` | Keyboard injection library, from the Interception release |
+| `focus_template.png` | Focus bubble template |
 
-Copy these straight from the release archive.
+All of these are included in the release package.
 
-Resource lookup is relative by default: current dir, exe dir, then parent dirs.
-To put resources elsewhere, set `YBB_ASSET_ROOT` to the resource root.
+Resources are looked up relative to the current directory, the executable and its parents.
+Set `YBB_ROOT` to override the resource root.
 
-## CLI
+## Command line
 
 ```
-ybb-cli.exe selftest                   environment check
-ybb-cli.exe run [queue] --go           pick cards per queue
-ybb-cli.exe dry                        recognize only, no input
-ybb-cli.exe probe                      screencap method check
-ybb-cli.exe parse "cards"              validate separators
-ybb-cli.exe focus <png>                read cards + detect focus
-ybb-cli.exe grab <dir> [frames] [ms]   burst capture
-ybb-cli.exe windows                    list visible windows
-ybb-cli.exe --version                  version & author
-ybb-cli.exe --license                  print MIT license
+ybb-cli.exe selftest                   Environment check
+ybb-cli.exe run [queue] --go           Pick cards from a queue
+ybb-cli.exe dry                        Recognise only, no input
+ybb-cli.exe probe                      Test screenshot methods
+ybb-cli.exe parse "cards"              Validate queue separators
+ybb-cli.exe focus <png>                Read cards and focus from an image
+ybb-cli.exe grab <dir> [frames] [gap]  Burst-capture screenshots
+ybb-cli.exe windows                    List visible windows
+ybb-cli.exe --version                  Version and author
+ybb-cli.exe --license                  Print the full MIT licence
 ```
 
-Queue separators: `→` `👉` newline space comma.
+Queue separators can be `→` `👉` newlines spaces or commas.
 
-## Layout
+## Project layout
 
 ```
 rs/
-├─ build.rs              embeds exe icon
-├─ assets/               ico/png icons and generation script
+├─ build.rs              Embeds the exe icon
+├─ assets/               ico/png icons and build scripts
 └─ src/
    ├─ gui.rs             GUI (egui)
-   ├─ engine.rs          main picking flow
-   ├─ picker.rs          card recognition / focus detection / settle
-   ├─ bubble.rs          focus bubble template matching
-   ├─ fingerprint.rs     card-name fingerprint (experimental, unused)
-   ├─ input.rs           keyboard injection (Interception / SendInput) + gamepad
-   ├─ vigem.rs           virtual Xbox 360 gamepad
-   ├─ xinput.rs          physical gamepad detection
+   ├─ engine.rs          Main picking loop
+   ├─ picker.rs          Card reading / focus / stability
+   ├─ bubble.rs          Focus bubble template matching
+   ├─ fingerprint.rs     Card fingerprints (experimental, currently unused)
+   ├─ input.rs           Keyboard injection (Interception / SendInput) + gamepad
+   ├─ vigem.rs           Virtual Xbox 360 controller
+   ├─ xinput.rs          Physical controller detection
    ├─ maa.rs / ocr.rs    MaaFramework bindings and OCR
-   ├─ win.rs             window find & bring-to-front
-   ├─ assets.rs          resource directory lookup
-   ├─ queue.rs           queue parsing
-   └─ score.rs           card-name similarity
+   ├─ win.rs             Window lookup and foreground handling
+   ├─ assets.rs          Resource directory lookup
+   ├─ queue.rs           Queue parsing
+   └─ score.rs           Card-name similarity
 ```
 
-## Third-party Components
+## Third-party components
 
-- [MaaFramework](https://github.com/MaaXYZ/MaaFramework) — screencap & OCR inference (LGPL-3.0)
+- [MaaFramework](https://github.com/MaaXYZ/MaaFramework) — capture and OCR inference (LGPL-3.0)
 - [Interception](https://github.com/oblitum/Interception) — driver-level keyboard injection (LGPL-3.0)
 - [ViGEmBus / ViGEmClient](https://github.com/nefarius/ViGEmBus) — virtual gamepad (BSD-3-Clause)
 - [egui / eframe](https://github.com/emilk/egui) — GUI (MIT / Apache-2.0)
 - PP-OCR model — text recognition
 
-Third-party binaries in the release archive follow their own licenses; do not redistribute them separately.
+Third-party binaries in the release keep their own licences; do not redistribute them separately.
 
 ## Disclaimer
 
-For personal learning and automation research only. You assume all consequences (including in-game loss and account risk) of using this tool.
+For personal learning and automation research only. You are responsible for any consequences of using this tool, including in-game losses or account risk.
 
 ## License
 
-MIT. Copyright (c) 2026 歪歪子 <1443423104@qq.com>. You may use, copy, modify and redistribute freely, provided the copyright notice is retained. See [LICENSE](LICENSE).
+MIT. Copyright © 2026 歪歪子 <1443423104@qq.com>. You may use, copy, modify and redistribute it freely, provided the copyright notice is retained. See [LICENSE](LICENSE).
 
 ---
 
-**作者 / Author**: 歪歪子 · 1443423104@qq.com
+**Author**: 歪歪子 · 1443423104@qq.com
+**中文**: [README.md](README.md)

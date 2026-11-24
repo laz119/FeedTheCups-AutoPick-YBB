@@ -6,7 +6,7 @@
 
 **选一张卡不到 1 秒，比手动快 3 倍** · 绿色免安装 · 支持自动重抽
 
-[中文](README.md) · [English](README.en.md) · [下载](../../releases) · [License](LICENSE)
+[中文](README.md) · [English](README.en.md) · [下载](#download) · [License](LICENSE)
 
 </div>
 
@@ -31,11 +31,13 @@
 
 - Windows 10 / 11 x64
 - 游戏切成**窗口**或**无边框窗口**（独占全屏截不到画面）
-- 首次使用需安装 [Interception](https://github.com/oblitum/Interception) 键盘驱动，装完重启（驱动已经打包进releases  直接阅读下一节即可 无需单独下载）
+- 首次使用需安装 [Interception](https://github.com/oblitum/Interception) 键盘驱动，装完重启（驱动已经打包进 releases，直接阅读下一节即可，无需单独下载）
+
+<a id="download"></a>
 
 ## 直接使用(运行这三步即可使用)
 
-到 [Releases](../../releases) 下载 `YBB-v1.0.zip`，解压后：
+到 [Releases](../../releases) 下载 `YBB-v1.1.zip`，解压后：
 
 1. 双击 `安装驱动.bat`（UAC 点「是」），重启电脑
 2. 双击 `检查环境.bat` 确认各项就绪
@@ -76,7 +78,7 @@ cargo build --release
 这些都可以从 Releases 里的发行包直接复制。
 
 默认按相对路径查找：当前目录、可执行文件所在目录、逐级父目录。
-如果想把资源放在别处，设环境变量 `YBB_ASSET_ROOT` 指向资源根目录即可。
+如果想把资源放在别处，设环境变量 `YBB_ROOT` 指向资源根目录即可。
 
 ## 命令行
 

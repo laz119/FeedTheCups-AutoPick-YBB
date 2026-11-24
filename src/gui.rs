@@ -202,6 +202,8 @@ struct App {
     input_mode: InputMode,
     sponsor: Option<egui::TextureHandle>,
     end_warned: bool,
+    /// 出错/停止后可以从哪一轮继续（0 起）
+    resume_at: Option<usize>,
 }
 
 impl App {
@@ -231,6 +233,10 @@ impl App {
             input_mode: InputMode::Keyboard,
             sponsor: load_sponsor(&cc.egui_ctx),
             end_warned: false,
+            // 调试用：YBB_UI_RESUME=3 可在启动时直接看「继续」提示条
+            resume_at: std::env::var("YBB_UI_RESUME")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         }
     }
 
@@ -246,6 +252,16 @@ impl App {
     }
 
     fn start(&mut self) {
+        self.start_at(0, true);
+    }
+
+    fn resume(&mut self) {
+        if let Some(i) = self.resume_at.take() {
+            self.start_at(i, false);
+        }
+    }
+
+    fn start_at(&mut self, start_index: usize, fresh: bool) {
         if self.running {
             return;
         }
@@ -254,11 +270,20 @@ impl App {
             self.push(Level::Err, "队列是空的，先把卡名贴进来".into());
             return;
         }
+        let start_index = start_index.min(queue.len() - 1);
         let body = format!("# 由 YBB 自动保存\n{}\n", queue.join("→"));
         let _ = std::fs::write("cards.txt", body);
 
-        self.log.clear();
-        self.progress = None;
+        if fresh {
+            self.log.clear();
+            self.progress = None;
+        } else {
+            self.push(
+                Level::Info,
+                format!("── 从第 {} 轮继续 ──", start_index + 1),
+            );
+        }
+        self.resume_at = None;
         self.running = true;
         self.stop = Arc::new(AtomicBool::new(false));
         self.end_warned = false;
@@ -269,6 +294,7 @@ impl App {
 
         let cfg = Config {
             queue,
+            start_index,
             go: self.go,
             max_reroll: 12,
             use_interception: true,
@@ -312,12 +338,24 @@ impl App {
                     self.running = false;
                     match r {
                         Ok(()) => {
+                            self.resume_at = None;
                             self.status = "完成".into();
                             self.push(Level::Ok, "── 全部完成 ──".into());
                         }
                         Err(e) => {
-                            self.status = "已停止".into();
                             self.push(Level::Err, format!("── {e} ──"));
+                            if let Some((a, _, _)) = self.progress {
+                                self.resume_at = Some(a.saturating_sub(1));
+                                self.status = "已停止 · 可继续".into();
+                                self.push(
+                                    Level::Warn,
+                                    format!(
+                                        "已停在第 {a} 轮；处理好游戏画面后点「继续」接着跑"
+                                    ),
+                                );
+                            } else {
+                                self.status = "已停止".into();
+                            }
                         }
                     }
                 }
@@ -329,7 +367,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("YBB").size(26.0).strong().color(ACCENT));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("v1.0").size(10.5).color(SUB));
+                ui.label(RichText::new("v1.1").size(10.5).color(SUB));
             });
         });
         ui.label(
@@ -455,6 +493,7 @@ impl eframe::App for App {
                             // 改了队列就回到「共 N 轮」，不显示上一轮的旧进度
                             if resp.changed() && !self.running {
                                 self.progress = None;
+                                self.resume_at = None;
                             }
                         });
                     ui.add_space(8.0);
@@ -495,13 +534,27 @@ impl eframe::App for App {
                             });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(RichText::new("自动存入").size(9.0).color(SUB));
+                            ui.add_space(6.0);
+                            let can = !self.running && !self.queue_text.trim().is_empty();
+                            let test_btn = egui::Button::new(
+                                RichText::new("试识别（不按键）").size(9.5).color(ACCENT),
+                            )
+                            .frame(false);
+                            if ui
+                                .add_enabled(can, test_btn)
+                                .on_hover_text("读当前三张卡和焦点，但不按任何键；用来确认认卡是否正确")
+                                .clicked()
+                            {
+                                self.go = false;
+                                self.start();
+                            }
                         });
                     });
                 });
 
                 ui.add_space(12.0);
 
-                // ---- 按钮（竖屏一行放得下三个）----
+                // ---- 按钮（开始 / 停止 / 继续）----
                 ui.horizontal(|ui| {
                     let can = !self.running && !self.queue_text.trim().is_empty();
 
@@ -526,14 +579,24 @@ impl eframe::App for App {
                         self.status = "正在停止 ...".into();
                     }
 
-                    let dry_btn = egui::Button::new(RichText::new("空跑").size(14.0).color(ACCENT))
-                        .fill(CARD)
-                        .stroke(Stroke::new(1.0f32, LINE))
-                        .rounding(Rounding::same(8.0))
-                        .min_size(egui::vec2(70.0, 34.0));
-                    if ui.add_enabled(can, dry_btn).clicked() {
-                        self.go = false;
-                        self.start();
+                    let resume_label = match self.resume_at {
+                        Some(i) => format!("继续 {}", i + 1),
+                        None => "继续".to_string(),
+                    };
+                    let resume_btn = egui::Button::new(
+                        RichText::new(resume_label).size(13.0).color(ACCENT),
+                    )
+                    .fill(CARD)
+                    .stroke(Stroke::new(1.0f32, LINE))
+                    .rounding(Rounding::same(8.0))
+                    .min_size(egui::vec2(70.0, 34.0));
+                    let can_resume = !self.running && self.resume_at.is_some();
+                    if ui
+                        .add_enabled(can_resume, resume_btn)
+                        .on_disabled_hover_text("出错或停止后，处理好画面可从当前轮继续")
+                        .clicked()
+                    {
+                        self.resume();
                     }
                 });
 
@@ -562,6 +625,48 @@ impl eframe::App for App {
 
                 // ---- 日志 ----
                 section_title(ui, "运行日志");
+                if let Some(idx) = self.resume_at {
+                    if !self.running {
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(0xF7, 0xEF, 0xE2))
+                            .stroke(Stroke::new(1.0f32, WARN))
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(Margin::symmetric(10.0, 7.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("已停在第 {} 轮", idx + 1))
+                                            .size(12.0)
+                                            .color(WARN)
+                                            .strong(),
+                                    );
+                                    ui.label(
+                                        RichText::new("处理好画面后点「继续」接着跑")
+                                            .size(11.0)
+                                            .color(SUB),
+                                    );
+                                    ui.with_layout(
+                                        Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            let btn = egui::Button::new(
+                                                RichText::new("继续")
+                                                    .size(12.5)
+                                                    .color(Color32::WHITE)
+                                                    .strong(),
+                                            )
+                                            .fill(ACCENT)
+                                            .rounding(Rounding::same(6.0))
+                                            .min_size(egui::vec2(58.0, 26.0));
+                                            if ui.add(btn).clicked() {
+                                                self.resume();
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        ui.add_space(6.0);
+                    }
+                }
                 egui::Frame::none()
                     .fill(LOG_BG)
                     .stroke(Stroke::new(1.0f32, LINE))

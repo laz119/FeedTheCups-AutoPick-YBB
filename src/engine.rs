@@ -10,7 +10,7 @@ use crate::assets;
 use crate::bubble::Bubble;
 use crate::consts::{MATCH_THRESHOLD, WINDOW_KEY};
 use crate::input::{self, Injector};
-use crate::maa::{self, Controller, Maa};
+use crate::maa::{self, Controller, Image, Maa};
 use crate::ocr::{Resource, Tasker};
 use crate::picker;
 use crate::score::score;
@@ -34,6 +34,8 @@ pub enum Msg {
 
 pub struct Config {
     pub queue: Vec<String>,
+    /// 从队列的第几轮开始（0 起）。出错后「继续」用它从当前轮接着跑。
+    pub start_index: usize,
     /// false = 空跑，只识别不按键
     pub go: bool,
     pub max_reroll: u32,
@@ -153,9 +155,17 @@ fn run_inner(
     let _ = picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), 3000);
 
     let total = cfg.queue.len();
+    if cfg.start_index >= total {
+        return Err("队列里没有可继续的轮次".into());
+    }
+    // 实验开关：复用确认后的变化帧，省一次截图；默认开启，设 YBB_FRAME_REUSE=0 可回退
+    let frame_reuse = std::env::var("YBB_FRAME_REUSE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let mut seed: Option<Image> = None;
     let t_all = Instant::now();
 
-    for (i, target) in cfg.queue.iter().enumerate() {
+    for (i, target) in cfg.queue.iter().enumerate().skip(cfg.start_index) {
         if stopped() {
             return Err("已停止".into());
         }
@@ -178,8 +188,13 @@ fn run_inner(
                 }
                 None => {
                     let t_l = Instant::now();
-                    let Some(l) = picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), 3000)
-                    else {
+                    let Some(l) = picker::settle_and_read_seeded(
+                        &ctrl,
+                        &tasker,
+                        tpl.as_ref(),
+                        3000,
+                        seed.take(),
+                    ) else {
                         return Err("等不到稳定的选卡画面".into());
                     };
                     t_look += t_l.elapsed().as_secs_f64() * 1000.0;
@@ -193,6 +208,9 @@ fn run_inner(
                 .map(|c| format!("[{}]", c.name))
                 .collect::<Vec<_>>()
                 .join(" ");
+            if look.auto_layout {
+                log(Level::Info, "  使用自动布局识别（特殊界面）".into());
+            }
 
             let mut best: Option<(usize, f64)> = None;
             for (k, c) in look.cards.iter().enumerate() {
@@ -220,16 +238,30 @@ fn run_inner(
                                 .into(),
                         );
                     };
-                    break (idx, f, look.cards.clone());
+                    break (idx, f, look.cards.clone(), look.auto_layout);
                 }
                 _ => {
                     log(Level::Step, format!("  当前没有 {target:?}  {shown}"));
+                    // 特殊界面（如恶魔能力）：队列里没有同名目标时，
+                    // 不按重抽（可能花杯币），暂停等用户手选，画面变了自动继续。
+                    if look.auto_layout {
+                        log(
+                            Level::Warn,
+                            "  检测到特殊界面，队列里没有同名目标；请在游戏里手动选择，选完自动继续"
+                                .into(),
+                        );
+                        let baseline = look.frame;
+                        if !picker::wait_screen_change(&ctrl, &baseline, 3.0, 300_000) {
+                            return Err("等待手动选择超时（5 分钟）".into());
+                        }
+                        continue;
+                    }
                     if rerolls >= cfg.max_reroll {
                         return Err(format!("「{target}」重抽 {} 次仍未出现，停止", rerolls));
                     }
                     let Some(inj) = &inj else {
                         log(Level::Warn, "  （空跑：本应重抽）".into());
-                        break (0, 0, look.cards.clone());
+                        break (0, 0, look.cards.clone(), look.auto_layout);
                     };
                     let t_rr = Instant::now();
                     inj.tap(input::Key::Reroll).map_err(|e| e.to_string())?;
@@ -265,7 +297,7 @@ fn run_inner(
             }
         };
 
-        let (target_idx, mut focus, snapshot) = picked;
+        let (target_idx, mut focus, snapshot, auto_layout) = picked;
 
         if let Some(inj) = &inj {
             let mut guard = 0;
@@ -283,14 +315,26 @@ fn run_inner(
                 let prev = focus;
                 let t_mv = Instant::now();
                 inj.tap(key).map_err(|e| e.to_string())?;
-                match picker::wait_focus_change(
-                    &ctrl,
-                    &tasker,
-                    &snapshot,
-                    tpl.as_ref(),
-                    prev,
-                    1500,
-                ) {
+                let next = if auto_layout {
+                    picker::wait_focus_change_global(
+                        &ctrl,
+                        &tasker,
+                        &snapshot,
+                        tpl.as_ref(),
+                        prev,
+                        1500,
+                    )
+                } else {
+                    picker::wait_focus_change(
+                        &ctrl,
+                        &tasker,
+                        &snapshot,
+                        tpl.as_ref(),
+                        prev,
+                        1500,
+                    )
+                };
+                match next {
                     Some(f) => {
                         focus = f;
                         t_move += t_mv.elapsed().as_secs_f64() * 1000.0;
@@ -321,11 +365,18 @@ fn run_inner(
                 &ctrl.screencap().map_err(|e| e.to_string())?,
             ));
             let changed = picker::wait_changed(&ctrl, band, 1.0, 3500);
+            let changed_ok = changed.is_some();
+            if frame_reuse {
+                // 把变化帧留给下一轮判稳，省一次截图
+                seed = changed;
+            } else {
+                seed = None;
+            }
             log(
                 Level::Ok,
                 format!(
                     "  {} 本轮 {:.2}s（看 {:.0}ms / 推 {:.0}ms）",
-                    if changed { "已选中" } else { "画面未变" },
+                    if changed_ok { "已选中" } else { "画面未变" },
                     t_round.elapsed().as_secs_f64(),
                     t_look,
                     t_move
