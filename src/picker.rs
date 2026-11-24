@@ -52,7 +52,63 @@ pub fn read_cards(t: &Tasker, img: &Image, only_rec: bool) -> Vec<CardSlot> {
     out
 }
 
-/// 焦点在第几张（0 起）。读不到气泡返回 None。
+/// 自动布局时判断一段文字像不像卡名：2–8 个字、至少两个汉字、排除标题/按钮/描述。
+fn auto_name_ok(s: &str) -> bool {
+    let t = crate::score::norm(s);
+    let n = t.chars().count();
+    if !(2..=8).contains(&n) {
+        return false;
+    }
+    if t.chars().filter(|c| is_cjk(*c)).count() < 2 {
+        return false;
+    }
+    const BAD: [&str; 10] = [
+        "选择", "恶魔", "重抽", "放弃", "余额", "礼物", "运营", "店铺", "上限", "概率",
+    ];
+    !BAD.iter().any(|b| t.contains(b))
+}
+
+/// 自动布局兜底：不依赖固定 ROI，在整块卡区做一次带检测的 OCR，
+/// 按左/中/右三列各取最靠上的「像卡名」的文字。
+pub fn read_cards_auto(t: &Tasker, img: &Image) -> Vec<CardSlot> {
+    let hits = t
+        .ocr_roi_ex(img, (0.02, 0.28, 0.98, 0.82), false)
+        .unwrap_or_default();
+    let w = img.width as f64;
+    let h = img.height as f64;
+    let cols = [(0.06, 0.42), (0.42, 0.70), (0.70, 0.99)];
+
+    let mut out = Vec::with_capacity(3);
+    for (lo, hi) in cols {
+        let mut best: Option<&OcrItem> = None;
+        for it in &hits {
+            let cx = (it.box_[0] as f64 + it.box_[2] as f64 / 2.0) / w;
+            let cy = (it.box_[1] as f64 + it.box_[3] as f64 / 2.0) / h;
+            if cx < lo || cx >= hi || cy < 0.28 || cy > 0.82 {
+                continue;
+            }
+            if !auto_name_ok(&it.text) {
+                continue;
+            }
+            if best.map(|b| it.box_[1] < b.box_[1]).unwrap_or(true) {
+                best = Some(it);
+            }
+        }
+        match best {
+            Some(b) => out.push(CardSlot {
+                name: crate::score::norm(&b.text),
+                raw: b.text.clone(),
+                box_: Some(b.box_),
+            }),
+            None => out.push(CardSlot {
+                name: String::new(),
+                raw: String::new(),
+                box_: None,
+            }),
+        }
+    }
+    out
+}
 pub fn focus_index(
     t: &Tasker,
     img: &Image,
@@ -124,6 +180,8 @@ pub fn focus_index(
 
 /// 判稳阈值：静止画面实测差值 0.000，留一点余量给抗锯齿/编码噪声
 pub const STABLE_DIFF: f64 = 0.5;
+/// 最短稳定时间：快机器上帧间隔可能只有十几毫秒，必须连续不变够久才算稳定
+pub const STABLE_MS: u64 = 50;
 /// 重抽后判定「画面真的变了」的阈值
 pub const CHANGE_DIFF: f64 = 0.5;
 
@@ -137,6 +195,8 @@ pub struct Look {
     pub shots: u32,
     /// 判稳时的那一帧，重抽后用来判断画面有没有真的刷新
     pub frame: Image,
+    /// 是否是自动布局兜底识别出来的（特殊界面）
+    pub auto_layout: bool,
 }
 
 /// 重抽后等画面失败的原因
@@ -172,13 +232,21 @@ fn settle_core(
     tpl: Option<&crate::bubble::Bubble>,
     timeout_ms: u64,
     baseline: Option<&Image>,
+    seed: Option<Image>,
     stable_needed: u32,
 ) -> Result<Look, SettleFail> {
     let start = std::time::Instant::now();
-    let mut prev: Option<Image> = None;
+    let seeded = seed.is_some();
+    let mut prev: Option<Image> = seed;
+    let mut prev_t: Option<std::time::Instant> = if seeded { Some(start) } else { None };
+    let mut stable_since: Option<std::time::Instant> = None;
     let mut shots = 0u32;
     let mut saw_change = false;
     let mut stable_run = 0u32;
+    // 第一次识别成功就直接过，不等 50ms；只有失败重试才走最短稳定时间
+    let mut first_try = true;
+    // 重抽和「复用上一帧」都可能碰到动画中间帧，卡名要像正常卡名才接受
+    let require_plausible = baseline.is_some() || seeded;
 
     loop {
         if start.elapsed().as_millis() as u64 > timeout_ms {
@@ -193,6 +261,7 @@ fn settle_core(
             continue;
         };
         shots += 1;
+        let now = std::time::Instant::now();
 
         let rois = name_rois_abs(&img);
         let band = crate::fingerprint::name_band(&rois);
@@ -214,32 +283,77 @@ fn settle_core(
             Some(p) => crate::fingerprint::band_diff(p, &img, band) < STABLE_DIFF,
         };
         if stable {
+            if stable_since.is_none() {
+                stable_since = prev_t.or(Some(now));
+            }
             stable_run += 1;
         } else {
             stable_run = 0;
+            stable_since = None;
         }
+        let stable_long_enough = stable_since
+            .map(|t| t.elapsed().as_millis() as u64 >= STABLE_MS)
+            .unwrap_or(false);
 
-        if stable_run >= stable_needed && differs {
+        let may_read = stable_run >= stable_needed
+            && differs
+            && (first_try || stable_long_enough);
+
+        if may_read {
+            first_try = false;
             let cards = read_cards(t, &img, true);
-            let ok = cards.iter().all(|c| !c.is_empty())
-                && (baseline.is_none() || plausible(&cards));
-            if ok {
-                let focus = focus_auto(t, &img, &cards, tpl);
+            let normal_ok = cards.iter().all(|c| !c.is_empty()) && plausible(&cards);
+            let normal_focus = if normal_ok {
+                focus_auto(t, &img, &cards, tpl)
+            } else {
+                None
+            };
+            if normal_ok && normal_focus.is_some() {
                 return Ok(Look {
                     cards,
+                    focus: normal_focus,
+                    settle_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    shots,
+                    frame: img,
+                    auto_layout: false,
+                });
+            }
+
+            // 固定 ROI 读不到卡名或焦点：自动布局兜底（恶魔能力等特殊界面）
+            let auto_cards = read_cards_auto(t, &img);
+            if auto_cards.iter().all(|c| !c.is_empty()) && plausible(&auto_cards) {
+                let focus = focus_auto_global(t, &img, &auto_cards, tpl);
+                return Ok(Look {
+                    cards: auto_cards,
                     focus,
                     settle_ms: start.elapsed().as_secs_f64() * 1000.0,
                     shots,
                     frame: img,
+                    auto_layout: true,
                 });
             }
+
+            // 普通卡名读到了、但焦点没有：保持原行为，让引擎报明确错误
+            if normal_ok {
+                return Ok(Look {
+                    cards,
+                    focus: None,
+                    settle_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    shots,
+                    frame: img,
+                    auto_layout: false,
+                });
+            }
+
             // 动画中间的占位帧：重新攒稳定窗口，别急着读
-            if baseline.is_some() {
+            if require_plausible {
                 stable_run = 0;
+                stable_since = Some(now);
             }
         }
 
         prev = Some(img);
+        prev_t = Some(now);
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
 }
@@ -251,7 +365,20 @@ pub fn settle_and_read(
     tpl: Option<&crate::bubble::Bubble>,
     timeout_ms: u64,
 ) -> Option<Look> {
-    settle_core(ctrl, t, tpl, timeout_ms, None, 1).ok()
+    settle_core(ctrl, t, tpl, timeout_ms, None, None, 1).ok()
+}
+
+/// 带「上一帧」的一次「看」：`seed` 是确认后 wait_changed 返回的变化帧，
+/// 直接拿它当第一帧比较，省掉一次截图。有 seed 时多要一次稳定比较，防止动画中间误判。
+pub fn settle_and_read_seeded(
+    ctrl: &crate::maa::Controller,
+    t: &Tasker,
+    tpl: Option<&crate::bubble::Bubble>,
+    timeout_ms: u64,
+    seed: Option<Image>,
+) -> Option<Look> {
+    let need = 1;
+    settle_core(ctrl, t, tpl, timeout_ms, None, seed, need).ok()
 }
 
 /// 重抽之后的一次「看」：稳定 **且** 必须不同于 `baseline`。
@@ -263,7 +390,7 @@ pub fn settle_after_change(
     baseline: &Image,
     timeout_ms: u64,
 ) -> Result<Look, SettleFail> {
-    settle_core(ctrl, t, tpl, timeout_ms, Some(baseline), 3)
+    settle_core(ctrl, t, tpl, timeout_ms, Some(baseline), None, 3)
 }
 
 /// 三个卡名 ROI 换成绝对像素
@@ -279,31 +406,62 @@ pub fn name_rois_abs(img: &Image) -> [[i32; 4]; 3] {
     out
 }
 
-/// 等画面变化：8ms 轮询卡名带差，超过阈值就返回 true。
-/// 这就是替代原版 `time.sleep(3.0)` 的东西——动画一结束立刻继续。
+/// 等画面变化：8ms 轮询卡名带差，超过阈值就返回变化后的那一帧。
+/// 返回帧可以喂给下一轮 `settle_and_read_seeded`，省掉一次截图。
 pub fn wait_changed(
     ctrl: &crate::maa::Controller,
     band: [i32; 4],
     threshold: f64,
     timeout_ms: u64,
-) -> bool {
+) -> Option<Image> {
     let start = std::time::Instant::now();
     let mut prev = match ctrl.screencap() {
         Ok(i) => i,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     loop {
         if start.elapsed().as_millis() as u64 > timeout_ms {
-            return false;
+            return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(8));
         let Ok(img) = ctrl.screencap() else {
             continue;
         };
         if crate::fingerprint::band_diff(&prev, &img, band) > threshold {
-            return true;
+            return Some(img);
         }
         prev = img;
+    }
+}
+
+/// 等整屏明显变化，用于「特殊界面暂停、等用户手选」。
+/// 每 300ms 看一次，不抢 CPU；默认给 5 分钟。
+pub fn wait_screen_change(
+    ctrl: &crate::maa::Controller,
+    baseline: &Image,
+    threshold: f64,
+    timeout_ms: u64,
+) -> bool {
+    let start = std::time::Instant::now();
+    let w = baseline.width as f64;
+    let h = baseline.height as f64;
+    let roi = [
+        (0.05 * w) as i32,
+        (0.25 * h) as i32,
+        (0.90 * w) as i32,
+        (0.65 * h) as i32,
+    ];
+    loop {
+        if start.elapsed().as_millis() as u64 > timeout_ms {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let Ok(img) = ctrl.screencap() else {
+            continue;
+        };
+        if crate::fingerprint::band_diff(baseline, &img, roi) > threshold {
+            return true;
+        }
     }
 }
 
@@ -390,6 +548,89 @@ pub fn focus_auto(
     focus_index(t, img, cards, true).0
 }
 
+/// 自动布局兜底：在整块卡区里找「选择」气泡，不限定窄带。
+/// 模板匹配失败时退回一次整块区域的 OCR，找含「选择」的最靠上的文字。
+pub fn focus_auto_global(
+    t: &Tasker,
+    img: &Image,
+    cards: &[CardSlot],
+    tpl: Option<&crate::bubble::Bubble>,
+) -> Option<usize> {
+    let h = img.height as f64;
+    let w = img.width as f64;
+    let b0 = cards.first().and_then(|c| c.box_)?;
+    let ny = (b0[1] as f64 + b0[3] as f64 / 2.0) / h;
+    let y0 = ((ny + 0.08) * h).max(0.45 * h) as usize;
+    let y1 = (0.98 * h) as usize;
+
+    let cx = if let Some(tpl) = tpl {
+        // 先在卡片区域内找，避开底部「礼物重抽 / 放弃」那排同样的「选择」提示；
+        // 找不到再放宽到整屏下半部分（普通界面的气泡位置更低）。
+        let y_mid = ((0.68 * h) as usize).max(y0 + 1);
+        let mut hit = tpl.find(img, y0, y_mid);
+        if hit.map(|(_, _, s)| s < 0.6).unwrap_or(true) {
+            hit = tpl.find(img, y0, y1);
+        }
+        let (bx, _by, score) = hit?;
+        if score < 0.5 {
+            return None;
+        }
+        (bx as f64 + tpl.size().0 as f64 / 2.0) / w
+    } else {
+        let hits = t
+            .ocr_roi_ex(img, (0.02, y0 as f64 / h, 0.98, 0.98), false)
+            .ok()?;
+        let b = hits
+            .iter()
+            .filter(|x| x.text.contains("选择"))
+            .min_by_key(|x| x.box_[1])?;
+        (b.box_[0] as f64 + b.box_[2] as f64 / 2.0) / w
+    };
+
+    let mut best = 0usize;
+    let mut best_d = f64::MAX;
+    for (i, c) in cards.iter().enumerate() {
+        let Some(b) = c.box_ else { continue };
+        let cc = (b[0] as f64 + b[2] as f64 / 2.0) / w;
+        let d = (cx - cc).abs();
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    Some(best)
+}
+
+/// 特殊界面用：在整块卡区轮询焦点，不限定窄带。
+pub fn wait_focus_change_global(
+    ctrl: &crate::maa::Controller,
+    t: &Tasker,
+    cards: &[CardSlot],
+    tpl: Option<&crate::bubble::Bubble>,
+    from: usize,
+    timeout_ms: u64,
+) -> Option<usize> {
+    std::thread::sleep(std::time::Duration::from_millis(FOCUS_PRE_WAIT_MS));
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed().as_millis() as u64 > timeout_ms {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let Ok(img) = ctrl.screencap() else {
+            continue;
+        };
+        if let Some(i) = focus_auto_global(t, &img, cards, tpl) {
+            if i != from {
+                return Some(i);
+            }
+        }
+    }
+}
+
+/// 推格后先等动画走一段，避免前几帧还停在旧焦点上白抓
+pub const FOCUS_PRE_WAIT_MS: u64 = 50;
+
 /// 等焦点离开当前卡。
 ///
 /// 原来的 `wait_changed` 盯的是**卡名带**，而气泡在卡名带下方，推格根本改不到那里，
@@ -402,6 +643,7 @@ pub fn wait_focus_change(
     from: usize,
     timeout_ms: u64,
 ) -> Option<usize> {
+    std::thread::sleep(std::time::Duration::from_millis(FOCUS_PRE_WAIT_MS));
     let start = std::time::Instant::now();
     loop {
         if start.elapsed().as_millis() as u64 > timeout_ms {
