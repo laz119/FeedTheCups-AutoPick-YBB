@@ -14,9 +14,10 @@ use egui::{
     Stroke,
 };
 
-use ybb::engine::{self, Config, Level, Msg};
+use ybb::engine::{self, Config, Level, Msg, Phase};
 use ybb::input::InputMode;
 use ybb::queue::parse_queue;
+use ybb::presets::{self, PresetMap};
 
 const BG: Color32 = Color32::from_rgb(0xFA, 0xF8, 0xF4);
 const CARD: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
@@ -30,6 +31,11 @@ const WARN: Color32 = Color32::from_rgb(0xA8, 0x7F, 0x42);
 const ERRC: Color32 = Color32::from_rgb(0xAE, 0x5E, 0x45);
 const LOG_BG: Color32 = Color32::from_rgb(0xFB, 0xF9, 0xF5);
 const GITHUB_URL: &str = "https://github.com/laz119/FeedTheCups-AutoPick-YBB/tree/main";
+
+/// 运行日志最多保留多少行；超过就丢掉最旧的，防止长时间挂机内存一直涨
+const MAX_LOG_LINES: usize = 1200;
+/// 单条日志最多保留多少字符，避免异常信息把日志撑爆
+const MAX_LOG_LINE_CHARS: usize = 800;
 
 /// 用系统默认浏览器打开链接
 fn open_url(url: &str) {
@@ -103,7 +109,34 @@ fn load_icon() -> std::sync::Arc<egui::IconData> {
     }
 }
 
+/// 只允许一个 YBB 实例，避免两个窗口同时给游戏发按键。
+fn single_instance_ok() -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = "Local\\YBB_SingleInstance\0".encode_utf16().collect();
+    unsafe {
+        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if h.is_null() {
+            return true;
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            windows_sys::Win32::Foundation::CloseHandle(h);
+            return false;
+        }
+        // 句柄故意不关：进程退出时由系统释放，期间一直占住互斥体
+        true
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    if !single_instance_ok() {
+        if let Some(w) = ybb::win::find("YBB ·") {
+            ybb::win::force_foreground(w.hwnd);
+        }
+        return Ok(());
+    }
+
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_icon(load_icon())
@@ -189,6 +222,64 @@ struct LogLine {
     text: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Settings {
+    max_reroll: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { max_reroll: 12 }
+    }
+}
+
+fn load_settings() -> Settings {
+    std::fs::read_to_string("settings.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
+        .map(|s| Settings {
+            max_reroll: s.max_reroll.min(99),
+        })
+        .unwrap_or_default()
+}
+
+fn save_settings(s: &Settings) {
+    if let Ok(text) = serde_json::to_string_pretty(s) {
+        let _ = std::fs::write("settings.json", text);
+    }
+}
+
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+
+fn phase_text(p: Phase) -> &'static str {
+    match p {
+        Phase::Idle => "待机",
+        Phase::WaitingScreen => "等待选卡画面",
+        Phase::Reading => "识别卡名",
+        Phase::MovingFocus => "移动焦点",
+        Phase::Confirming => "确认选卡",
+        Phase::WaitingNext => "等待下一屏",
+        Phase::Rerolling => "重抽",
+        Phase::Done => "完成",
+    }
+}
+
 struct App {
     ctx: egui::Context,
     queue_text: String,
@@ -204,6 +295,11 @@ struct App {
     end_warned: bool,
     /// 出错/停止后可以从哪一轮继续（0 起）
     resume_at: Option<usize>,
+    /// 每轮最多重抽次数
+    max_reroll: u32,
+    presets: PresetMap,
+    preset_name: String,
+    known_cards: Vec<String>,
 }
 
 impl App {
@@ -219,6 +315,7 @@ impl App {
                     .join("\n")
             })
             .unwrap_or_default();
+        let settings = load_settings();
 
         Self {
             ctx: cc.egui_ctx.clone(),
@@ -237,6 +334,18 @@ impl App {
             resume_at: std::env::var("YBB_UI_RESUME")
                 .ok()
                 .and_then(|v| v.parse().ok()),
+            max_reroll: settings.max_reroll,
+            presets: presets::load(),
+            preset_name: String::new(),
+            known_cards: std::fs::read_to_string("card_pool.txt")
+                .map(|s| {
+                    s.lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -244,10 +353,76 @@ impl App {
         parse_queue(&self.queue_text).len()
     }
 
+    fn save_preset(&mut self) {
+        let mut name = self.preset_name.trim().to_string();
+        if name.is_empty() {
+            name = format!("预设 {}", self.presets.len() + 1);
+        }
+        self.presets.insert(name, self.queue_text.clone());
+        presets::save(&self.presets);
+        self.preset_name.clear();
+    }
+
+    fn load_preset(&mut self, name: &str) {
+        if let Some(text) = self.presets.get(name) {
+            self.queue_text = text.clone();
+            self.progress = None;
+            self.resume_at = None;
+        }
+    }
+
+    fn delete_preset(&mut self, name: &str) {
+        self.presets.remove(name);
+        presets::save(&self.presets);
+    }
+
+    fn validation_hints(&self) -> Vec<String> {
+        let names = parse_queue(&self.queue_text);
+        let mut hints = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for n in &names {
+            if !seen.insert(n.clone()) {
+                hints.push(format!("队列里重复了「{n}」"));
+            }
+        }
+        if !self.known_cards.is_empty() {
+            for n in &names {
+                if self.known_cards.iter().any(|k| k == n) {
+                    continue;
+                }
+                if let Some(base) = n.strip_suffix('+') {
+                    if self.known_cards.iter().any(|k| k == base) {
+                        continue;
+                    }
+                }
+                let close = self
+                    .known_cards
+                    .iter()
+                    .filter(|k| levenshtein(n, k) <= 1)
+                    .min_by_key(|k| levenshtein(n, k));
+                if let Some(k) = close {
+                    hints.push(format!("「{n}」是不是「{k}」？"));
+                }
+            }
+        }
+        hints.truncate(4);
+        hints
+    }
+
     fn push(&mut self, level: Level, text: String) {
+        let text = if text.chars().count() > MAX_LOG_LINE_CHARS {
+            let mut t: String = text.chars().take(MAX_LOG_LINE_CHARS).collect();
+            t.push('…');
+            t
+        } else {
+            text
+        };
         self.log.push(LogLine { level, text });
-        if self.log.len() > 3000 {
-            self.log.drain(0..800);
+        if self.log.len() > MAX_LOG_LINES {
+            // 一次多丢一些，避免每来一行都搬一次 Vec
+            let keep = MAX_LOG_LINES * 3 / 4;
+            let drop = self.log.len() - keep;
+            self.log.drain(0..drop);
         }
     }
 
@@ -296,7 +471,7 @@ impl App {
             queue,
             start_index,
             go: self.go,
-            max_reroll: 12,
+            max_reroll: self.max_reroll,
             use_interception: true,
             input: self.input_mode,
         };
@@ -325,6 +500,7 @@ impl App {
         for m in batch {
             match m {
                 Msg::Log(lv, s) => self.push(lv, s),
+                Msg::Phase(p) => self.status = phase_text(p).into(),
                 Msg::Progress(a, b, t) => {
                     // 进入最后一轮 = 前面都选完了，提醒快结束
                     if a == b && b > 1 && !self.end_warned {
@@ -363,11 +539,125 @@ impl App {
         }
     }
 
-    fn draw_header(&self, ui: &mut egui::Ui) {
+    fn log_text(&self) -> String {
+        let mut s = String::new();
+        s.push_str("YBB v1.1\n");
+        if let Some((a, b, t)) = &self.progress {
+            s.push_str(&format!("进度: {a}/{b}  {t}\n"));
+        }
+        s.push_str(&format!("状态: {}\n", self.status));
+        s.push_str("---\n");
+        for l in &self.log {
+            let tag = match l.level {
+                Level::Info => "INFO",
+                Level::Step => "STEP",
+                Level::Ok => "OK",
+                Level::Warn => "WARN",
+                Level::Err => "ERR",
+            };
+            s.push_str(&format!("[{tag}] {}\n", l.text));
+        }
+        s
+    }
+
+    fn copy_log(&mut self, ctx: &egui::Context) {
+        let text = self.log_text();
+        ctx.output_mut(|o| o.copied_text = text);
+        self.push(Level::Ok, "日志已复制到剪贴板".into());
+    }
+
+    fn export_log(&mut self) {
+        let _ = std::fs::create_dir_all("logs");
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = format!("logs/ybb-log-{secs}.txt");
+        match std::fs::write(&path, self.log_text()) {
+            Ok(_) => self.push(Level::Ok, format!("日志已导出: {path}")),
+            Err(e) => self.push(Level::Err, format!("日志导出失败: {e}")),
+        }
+    }
+
+    fn log_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("日志", |ui| {
+            if ui.button("复制日志").clicked() {
+                self.copy_log(ui.ctx());
+                ui.close_menu();
+            }
+            if ui.button("导出日志").clicked() {
+                self.export_log();
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("清空日志").clicked() {
+                self.log.clear();
+                ui.close_menu();
+            }
+        });
+    }
+
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("设置", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("最大重抽").size(11.5).color(SUB));
+                let resp = ui.add(
+                    egui::DragValue::new(&mut self.max_reroll)
+                        .range(0..=99)
+                        .speed(1.0)
+                        .suffix(" 次"),
+                );
+                if resp.changed() {
+                    save_settings(&Settings {
+                        max_reroll: self.max_reroll,
+                    });
+                }
+            });
+            ui.label(
+                RichText::new("每轮最多重抽几次，0 表示不重抽")
+                    .size(9.5)
+                    .color(SUB),
+            );
+            ui.separator();
+            ui.menu_button("队列预设", |ui| {
+                ui.set_min_width(220.0);
+                let names: Vec<String> = self.presets.keys().cloned().collect();
+                if names.is_empty() {
+                    ui.label(RichText::new("还没有预设").size(10.0).color(SUB));
+                }
+                for name in names {
+                    ui.horizontal(|ui| {
+                        if ui.button(&name).clicked() {
+                            self.load_preset(&name);
+                            ui.close_menu();
+                        }
+                        if ui.small_button("×").clicked() {
+                            self.delete_preset(&name);
+                        }
+                    });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.preset_name)
+                            .hint_text("预设名")
+                            .desired_width(120.0),
+                    );
+                    if ui.button("保存当前").clicked() {
+                        self.save_preset();
+                    }
+                });
+            });
+        });
+    }
+
+    fn draw_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("YBB").size(26.0).strong().color(ACCENT));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(RichText::new("v1.1").size(10.5).color(SUB));
+                self.settings_menu(ui);
+                self.log_menu(ui);
             });
         });
         ui.label(
@@ -426,43 +716,59 @@ impl eframe::App for App {
                     .inner_margin(Margin::symmetric(14.0, 6.0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("作者  歪歪子").size(10.5).color(SUB));
-                    ui.add_space(6.0);
-                    self.support_button(ui);
-                    ui.add_space(4.0);
-                    let gh = ui
-                        .add(
-                            egui::Label::new(RichText::new("GitHub").size(10.5).color(ACCENT))
+                let rect = ui.available_rect_before_wrap();
+                let h = 20.0;
+                let full = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), h));
+
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(full)
+                        .layout(Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label(RichText::new("作者  歪歪子").size(10.5).color(SUB))
+                            .on_hover_text("1443423104@qq.com");
+                        ui.add_space(6.0);
+                        self.support_button(ui);
+                    },
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(full)
+                        .layout(Layout::right_to_left(Align::Center)),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let gh = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new("去 GitHub 获取最新版")
+                                        .size(10.5)
+                                        .color(ACCENT),
+                                )
                                 .sense(egui::Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_ui(|ui| {
-                            ui.set_max_width(330.0);
-                            ui.label(
-                                RichText::new(GITHUB_URL)
-                                    .size(10.0)
-                                    .monospace()
-                                    .color(SUB),
-                            );
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new("点击用浏览器打开")
-                                    .size(9.5)
-                                    .color(ACCENT),
-                            );
-                        });
-                    if gh.clicked() {
-                        open_url(GITHUB_URL);
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("1443423104@qq.com")
-                                .size(10.5)
-                                .color(Color32::from_rgb(0xA6, 0xA0, 0x96)),
-                        );
-                    });
-                });
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_ui(|ui| {
+                                ui.set_max_width(330.0);
+                                ui.label(
+                                    RichText::new(GITHUB_URL)
+                                        .size(10.0)
+                                        .monospace()
+                                        .color(SUB),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new("点击打开 GitHub 仓库主页")
+                                        .size(9.5)
+                                        .color(ACCENT),
+                                );
+                            });
+                        if gh.clicked() {
+                            open_url(GITHUB_URL);
+                        }
+                    },
+                );
+                ui.allocate_space(egui::vec2(rect.width(), h));
             });
 
         egui::CentralPanel::default()
@@ -496,6 +802,13 @@ impl eframe::App for App {
                                 self.resume_at = None;
                             }
                         });
+                    let hints = self.validation_hints();
+                    if !hints.is_empty() {
+                        ui.add_space(4.0);
+                        for h in hints {
+                            ui.label(RichText::new(format!("⚠ {h}")).size(10.0).color(WARN));
+                        }
+                    }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let total_now = self.rounds();

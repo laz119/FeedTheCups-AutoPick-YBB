@@ -20,6 +20,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 pub enum Key {
     Left,
     Right,
+    Down,
     Confirm,
     Reroll,
 }
@@ -30,6 +31,7 @@ impl Key {
         match self {
             Key::Left => 0x41,    // A
             Key::Right => 0x44,   // D
+            Key::Down => 0x53,    // S
             Key::Confirm => 0x20, // Space
             Key::Reroll => 0x4A,  // J
         }
@@ -39,6 +41,7 @@ impl Key {
         match self {
             Key::Left => 0x1E,    // A
             Key::Right => 0x20,   // D
+            Key::Down => 0x1F,    // S
             Key::Confirm => 0x39, // Space
             Key::Reroll => 0x24,  // J
         }
@@ -47,6 +50,7 @@ impl Key {
         match self {
             Key::Left => "A(左)",
             Key::Right => "D(右)",
+            Key::Down => "S(下)",
             Key::Confirm => "空格(确认)",
             Key::Reroll => "J(重抽)",
         }
@@ -262,6 +266,7 @@ impl Injector for VigemInjector {
         let b = match key {
             Key::Left => crate::vigem::btn::DPAD_LEFT,
             Key::Right => crate::vigem::btn::DPAD_RIGHT,
+            Key::Down => crate::vigem::btn::DPAD_DOWN,
             Key::Confirm => crate::vigem::btn::A,
             Key::Reroll => crate::vigem::btn::RB,
         };

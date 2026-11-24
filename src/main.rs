@@ -62,6 +62,8 @@ fn main() {
         "ocr" => ocr_cmd(&args[1..]),
         "scan" => scan_cmd(&args[1..]),
         "autofocus" => autofocus_cmd(&args[1..]),
+        "ocrbench" => ocrbench_cmd(&args[1..]),
+        "ocrort" => ocrort_cmd(&args[1..]),
         "focus" => focus_cmd(&args[1..]),
         "focust" => focust_cmd(&args[1..]),
         "parse" => parse_cmd(&args[1..]),
@@ -149,7 +151,7 @@ fn tap_cmd(rest: &[String]) {
     } else {
         ybb::input::InputMode::Keyboard
     };
-    let inj = ybb::input::build_mode(mode, maa.clone(), win.hwnd, use_icpt, 60)
+    let inj = ybb::input::build_mode(mode, maa.clone(), win.hwnd, use_icpt, 30)
         .unwrap_or_else(|e| die(&e));
     println!("注入方式: {}", inj.name());
     println!("按一下 {} ...", key.name());
@@ -240,6 +242,7 @@ fn run_cmd(rest: &[String]) {
             ybb::engine::Msg::Progress(a, b, t) => {
                 logln!("\n第 {a}/{b} 轮  目标={t:?}");
             }
+            ybb::engine::Msg::Phase(_) => {}
             ybb::engine::Msg::Done(r) => match r {
                 Ok(()) => {}
                 Err(e) => logln!("停止：{e}"),
@@ -347,6 +350,16 @@ fn dry_cmd(rest: &[String]) {
     let target = &queue[0];
 
     let (maa, tasker) = init_ocr();
+    let ort = match ybb::ort_ocr::OrtOcr::from_assets(4) {
+        Ok(o) => {
+            println!("OCR: ORT 批量");
+            Some(o)
+        }
+        Err(e) => {
+            println!("OCR: MAA（ORT 不可用：{e}）");
+            None
+        }
+    };
     let Some(win) = win::find(WINDOW_KEY) else {
         die("没找到游戏窗口");
     };
@@ -369,7 +382,7 @@ fn dry_cmd(rest: &[String]) {
 
     // 热身：截图 + 完整跑一次识别，把模型预热和缓存都喂满，之后才是稳态数字
     let _ = ctrl.screencap();
-    let warm = ybb::picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), 3000);
+    let warm = ybb::picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), ort.as_ref(), None, 3000);
     let seed = if std::env::var("YBB_FRAME_REUSE")
         .map(|v| v != "0")
         .unwrap_or(true)
@@ -381,7 +394,7 @@ fn dry_cmd(rest: &[String]) {
 
     let t_all = Instant::now();
     let Some(look) =
-        ybb::picker::settle_and_read_seeded(&ctrl, &tasker, tpl.as_ref(), 3000, seed)
+        ybb::picker::settle_and_read_seeded(&ctrl, &tasker, tpl.as_ref(), ort.as_ref(), None, 3000, seed)
     else {
         die("等不到稳定的选卡画面");
     };
@@ -875,6 +888,176 @@ fn autofocus_cmd(rest: &[String]) {
         println!("  第{}张  {:?}  box={:?}{}", i + 1, c.name, c.box_, mark);
     }
     println!("焦点: {:?}", focus.map(|i| i + 1));
+}
+
+/// 临时调试：在当前 OCR 上跑卡名裁剪数据集，输出准确率和耗时
+fn ocrbench_cmd(rest: &[String]) {
+    let dir = rest
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| "dataset".to_string());
+    let csv_path = std::path::Path::new(&dir).join("names_labels.csv");
+    let text = std::fs::read_to_string(&csv_path)
+        .unwrap_or_else(|e| die(&format!("读不到 {}: {e}", csv_path.display())));
+    let (_maa, tasker) = init_ocr();
+
+    let mut total = 0usize;
+    let mut correct = 0usize;
+    let mut times: Vec<f64> = Vec::new();
+    let mut bad: Vec<(String, String, String)> = Vec::new();
+
+    for line in text.lines().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let p: Vec<&str> = line.splitn(5, ',').collect();
+        if p.len() < 4 {
+            continue;
+        }
+        let file = p[0].trim();
+        let label = p[3].trim().trim_matches('"');
+        let path = std::path::Path::new(&dir).join("names").join(file);
+        let img = match ybb::maa::Image::load_bgr(&path) {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("跳过 {file}: {e}");
+                continue;
+            }
+        };
+
+        let t0 = Instant::now();
+        let hits = tasker
+            .ocr_roi_ex(&img, (0.0, 0.0, 1.0, 1.0), true)
+            .unwrap_or_default();
+        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+
+        let got = hits
+            .into_iter()
+            .max_by_key(|x| x.text.chars().count())
+            .map(|x| x.text)
+            .unwrap_or_default();
+        total += 1;
+        if ybb::score::norm(&got) == ybb::score::norm(label) {
+            correct += 1;
+        } else {
+            bad.push((file.to_string(), label.to_string(), got));
+        }
+    }
+
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if times.is_empty() {
+        0.0
+    } else {
+        times[times.len() / 2]
+    };
+    let avg = if times.is_empty() {
+        0.0
+    } else {
+        times.iter().sum::<f64>() / times.len() as f64
+    };
+
+    println!(
+        "样本 {total}  正确 {correct}  准确率 {:.1}%  单张中位 {:.0}ms  平均 {:.0}ms",
+        if total == 0 { 0.0 } else { correct as f64 * 100.0 / total as f64 },
+        median,
+        avg
+    );
+    for (file, label, got) in &bad {
+        println!("  ✗ {file}: 应为 {label:?}，识别为 {got:?}");
+    }
+}
+
+/// 临时调试：用 ORT 对整帧的三张卡名框做 batch 识别
+fn ocrort_cmd(rest: &[String]) {
+    let dir = rest
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| "dataset".to_string());
+    let csv_path = std::path::Path::new(&dir).join("names_labels.csv");
+    let text = std::fs::read_to_string(&csv_path)
+        .unwrap_or_else(|e| die(&format!("读不到 {}: {e}", csv_path.display())));
+
+    let engine = ybb::ort_ocr::OrtOcr::new(
+        "_internal/ort/onnxruntime.dll",
+        "model/ocr/rec.onnx",
+        "model/ocr/keys.txt",
+        4,
+    )
+    .unwrap_or_else(|e| die(&e));
+
+    let mut frames: std::collections::BTreeMap<String, Vec<(usize, String, [i32; 4])>> =
+        std::collections::BTreeMap::new();
+    for line in text.lines().skip(1) {
+        let p: Vec<&str> = line.splitn(5, ',').collect();
+        if p.len() < 5 {
+            continue;
+        }
+        let slot: usize = p[2].parse().unwrap_or(0);
+        let label = p[3].trim().to_string();
+        let box_s = p[4].trim().trim_matches('"');
+        let nums: Vec<i32> = box_s
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        if nums.len() != 4 {
+            continue;
+        }
+        frames
+            .entry(p[1].to_string())
+            .or_default()
+            .push((slot, label, [nums[0], nums[1], nums[2], nums[3]]));
+    }
+
+    let mut total = 0usize;
+    let mut correct = 0usize;
+    let mut times = Vec::new();
+    let mut bad = Vec::new();
+    for (frame, mut items) in frames {
+        if items.len() != 3 {
+            continue;
+        }
+        items.sort_by_key(|x| x.0);
+        let path = std::path::Path::new(&dir).join("frames").join(&frame);
+        let img = ybb::maa::Image::load_bgr(&path).unwrap_or_else(|e| die(&e));
+        let w = img.width as f64;
+        let h = img.height as f64;
+        let mut rois = [(0.0, 0.0, 1.0, 1.0); 3];
+        for (i, (_, _, b)) in items.iter().enumerate() {
+            rois[i] = (b[0] as f64 / w, b[1] as f64 / h, b[2] as f64 / w, b[3] as f64 / h);
+        }
+
+        let t0 = Instant::now();
+        let got = engine
+            .read_rois(&img, &rois)
+            .unwrap_or_else(|e| die(&e));
+        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+
+        for (i, (_, label, _)) in items.iter().enumerate() {
+            total += 1;
+            if got[i] == *label {
+                correct += 1;
+            } else {
+                bad.push((frame.clone(), label.clone(), got[i].clone()));
+            }
+        }
+    }
+
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if times.is_empty() {
+        0.0
+    } else {
+        times[times.len() / 2]
+    };
+    println!(
+        "ORT batch3  样本 {total}  正确 {correct}  准确率 {:.1}%  每帧中位 {:.1}ms",
+        if total == 0 { 0.0 } else { correct as f64 * 100.0 / total as f64 },
+        median
+    );
+    for (frame, label, got) in &bad {
+        println!("  ✗ {frame}: 应为 {label:?}，识别为 {got:?}");
+    }
 }
 
 /// 解析 `--ep cpu|directml|webgpu|auto`；没给就返回 None（用默认）
