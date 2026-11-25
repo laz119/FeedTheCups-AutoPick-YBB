@@ -229,6 +229,52 @@ impl Drop for InterceptionInjector {
     }
 }
 
+/// Interception 驱动状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverStatus {
+    /// 驱动已装且能创建上下文
+    Ready,
+    /// interception.dll 在，但驱动没装（create_context 返回空）
+    NotInstalled,
+    /// 连 interception.dll 都找不到/加载不了
+    DllMissing,
+}
+
+/// 检测 Interception 驱动是否可用。只创建/销毁上下文，不发送任何按键。
+pub fn driver_status() -> DriverStatus {
+    let mut cands: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            cands.push(d.join("interception.dll"));
+            cands.push(d.join("_internal").join("interception.dll"));
+        }
+    }
+    cands.push(std::path::PathBuf::from("interception.dll"));
+    cands.push(std::path::PathBuf::from("_internal/interception.dll"));
+
+    let Some(dll) = cands.into_iter().find(|p| p.exists()) else {
+        return DriverStatus::DllMissing;
+    };
+    unsafe {
+        let Ok(lib) = libloading::Library::new(&dll) else {
+            return DriverStatus::DllMissing;
+        };
+        let Ok(create) = lib.get::<CreateCtx>(b"interception_create_context\0") else {
+            return DriverStatus::DllMissing;
+        };
+        let Ok(destroy) = lib.get::<DestroyCtx>(b"interception_destroy_context\0") else {
+            return DriverStatus::DllMissing;
+        };
+        let ctx = create();
+        if ctx.is_null() {
+            DriverStatus::NotInstalled
+        } else {
+            destroy(ctx);
+            DriverStatus::Ready
+        }
+    }
+}
+
 /// 按优先级建一个可用的注入器：Interception 优先，退回 SendInput
 pub fn build(prefer_keyboard_driver: bool, hold_ms: u64) -> Box<dyn Injector> {
     if prefer_keyboard_driver {

@@ -42,3 +42,21 @@ pub fn maa_bin() -> Result<PathBuf, String> {
 pub fn ocr_model() -> Result<PathBuf, String> {
     find("model/ocr", "rec.onnx").ok_or_else(|| "找不到 model/ocr".to_string())
 }
+
+/// 打包版启动时把工作目录切到 exe 所在目录，保证 settings.json、cards.txt、
+/// card_pool.txt、日志、模板等相对路径都相对程序目录，而不是快捷方式的“起始位置”。
+/// 开发时（target/release 下没有 _internal/model）不动，避免影响 cargo run。
+pub fn chdir_to_app() {
+    if std::env::var("YBB_ROOT").is_ok() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    if dir.join("_internal").exists() || dir.join("model").exists() {
+        let _ = std::env::set_current_dir(dir);
+    }
+}

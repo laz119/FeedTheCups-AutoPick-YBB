@@ -110,6 +110,7 @@ fn load_icon() -> std::sync::Arc<egui::IconData> {
 }
 
 /// 只允许一个 YBB 实例，避免两个窗口同时给游戏发按键。
+
 fn single_instance_ok() -> bool {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
@@ -130,6 +131,7 @@ fn single_instance_ok() -> bool {
 }
 
 fn main() -> eframe::Result<()> {
+    ybb::assets::chdir_to_app();
     if !single_instance_ok() {
         if let Some(w) = ybb::win::find("YBB ·") {
             ybb::win::force_foreground(w.hwnd);
@@ -193,6 +195,20 @@ fn setup_style(ctx: &egui::Context) {
     style.visuals.selection.stroke = Stroke::new(1.0f32, ACCENT);
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(14.0, 7.0);
+    // 菜单：Chrome 风格的白卡片、圆角、轻阴影
+    style.spacing.menu_margin = Margin::same(8.0);
+    style.spacing.menu_width = 284.0;
+    style.spacing.menu_spacing = 6.0;
+    style.visuals.menu_rounding = Rounding::same(10.0);
+    style.visuals.window_rounding = Rounding::same(10.0);
+    style.visuals.window_fill = Color32::WHITE;
+    style.visuals.window_stroke = Stroke::new(1.0f32, Color32::from_gray(222));
+    style.visuals.popup_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 6.0),
+        blur: 18.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(38),
+    };
     // 赞赏码悬停要跟手：默认 0.5s 延迟太慢了
     style.interaction.tooltip_delay = 0.0;
     style.interaction.tooltip_grace_time = 0.0;
@@ -225,11 +241,23 @@ struct LogLine {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Settings {
     max_reroll: u32,
+    #[serde(default = "default_true")]
+    preload_model: bool,
+    #[serde(default)]
+    skip_driver_prompt: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { max_reroll: 12 }
+        Self {
+            max_reroll: 12,
+            preload_model: true,
+            skip_driver_prompt: false,
+        }
     }
 }
 
@@ -239,6 +267,8 @@ fn load_settings() -> Settings {
         .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
         .map(|s| Settings {
             max_reroll: s.max_reroll.min(99),
+            preload_model: s.preload_model,
+            skip_driver_prompt: s.skip_driver_prompt,
         })
         .unwrap_or_default()
 }
@@ -280,6 +310,60 @@ fn phase_text(p: Phase) -> &'static str {
     }
 }
 
+
+
+/// 自绘开关行：整行可点，右侧一个胶囊开关。
+fn toggle_row(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
+    let width = ui.available_width();
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::click());
+    let painter = ui.painter();
+    if resp.hovered() {
+        painter.rect_filled(rect, 6.0, Color32::from_gray(243));
+    }
+    painter.text(
+        rect.left_center() + egui::vec2(4.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        INK,
+    );
+    let sw = egui::Rect::from_center_size(
+        rect.right_center() - egui::vec2(22.0, 0.0),
+        egui::vec2(34.0, 18.0),
+    );
+    painter.rect_filled(
+        sw,
+        9.0,
+        if *on { ACCENT } else { Color32::from_gray(205) },
+    );
+    let knob_x = if *on { sw.right() - 9.0 } else { sw.left() + 9.0 };
+    painter.circle_filled(
+        egui::pos2(knob_x, sw.center().y),
+        7.0,
+        Color32::WHITE,
+    );
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.changed()
+}
+
+fn menu_section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(7.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new("●").size(7.5).color(ACCENT));
+        ui.label(RichText::new(title).size(10.0).strong().color(SUB));
+    });
+    ui.add_space(1.0);
+    ui.separator();
+}
+
+fn menu_hint(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(9.8).color(SUB));
+}
+
 struct App {
     ctx: egui::Context,
     queue_text: String,
@@ -297,6 +381,13 @@ struct App {
     resume_at: Option<usize>,
     /// 每轮最多重抽次数
     max_reroll: u32,
+    /// true = 打开程序就预加载模型；false = 只在选卡时加载，跑完释放
+    preload_model: bool,
+    /// 首次启动检测到没装 Interception 驱动时弹窗
+    driver_prompt: bool,
+    driver_msg: Option<String>,
+    driver_done: bool,
+    skip_driver_prompt: bool,
     presets: PresetMap,
     preset_name: String,
     known_cards: Vec<String>,
@@ -316,6 +407,9 @@ impl App {
             })
             .unwrap_or_default();
         let settings = load_settings();
+        if settings.preload_model {
+            ybb::ort_ocr::preload(4);
+        }
 
         Self {
             ctx: cc.egui_ctx.clone(),
@@ -335,6 +429,15 @@ impl App {
                 .ok()
                 .and_then(|v| v.parse().ok()),
             max_reroll: settings.max_reroll,
+            preload_model: settings.preload_model,
+            driver_prompt: (!settings.skip_driver_prompt
+                && matches!(
+                    ybb::input::driver_status(),
+                    ybb::input::DriverStatus::NotInstalled
+                )),
+            driver_msg: None,
+            driver_done: false,
+            skip_driver_prompt: settings.skip_driver_prompt,
             presets: presets::load(),
             preset_name: String::new(),
             known_cards: std::fs::read_to_string("card_pool.txt")
@@ -474,6 +577,7 @@ impl App {
             max_reroll: self.max_reroll,
             use_interception: true,
             input: self.input_mode,
+            preload_model: self.preload_model,
         };
         let stop = self.stop.clone();
         let ctx = self.ctx.clone();
@@ -541,7 +645,7 @@ impl App {
 
     fn log_text(&self) -> String {
         let mut s = String::new();
-        s.push_str("YBB v1.1\n");
+        s.push_str("YBB v1.2\n");
         if let Some((a, b, t)) = &self.progress {
             s.push_str(&format!("进度: {a}/{b}  {t}\n"));
         }
@@ -579,75 +683,138 @@ impl App {
         }
     }
 
-    fn log_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("日志", |ui| {
-            if ui.button("复制日志").clicked() {
-                self.copy_log(ui.ctx());
-                ui.close_menu();
-            }
-            if ui.button("导出日志").clicked() {
-                self.export_log();
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("清空日志").clicked() {
-                self.log.clear();
-                ui.close_menu();
-            }
-        });
-    }
-
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("设置", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("最大重抽").size(11.5).color(SUB));
-                let resp = ui.add(
-                    egui::DragValue::new(&mut self.max_reroll)
-                        .range(0..=99)
-                        .speed(1.0)
-                        .suffix(" 次"),
-                );
-                if resp.changed() {
-                    save_settings(&Settings {
-                        max_reroll: self.max_reroll,
-                    });
-                }
-            });
-            ui.label(
-                RichText::new("每轮最多重抽几次，0 表示不重抽")
-                    .size(9.5)
-                    .color(SUB),
-            );
+            ui.set_width(300.0);
+            // 菜单内按钮做成「整行悬停」的扁平样式
+            ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            ui.visuals_mut().widgets.hovered.weak_bg_fill = Color32::from_gray(243);
+            ui.visuals_mut().widgets.active.weak_bg_fill = Color32::from_gray(233);
+            ui.spacing_mut().item_spacing.y = 5.0;
+
+            ui.add_space(1.0);
+            ui.label(RichText::new("偏好设置").size(14.5).strong().color(INK));
+            ui.label(RichText::new("改动会立即保存").size(9.5).color(SUB));
+            ui.add_space(3.0);
             ui.separator();
-            ui.menu_button("队列预设", |ui| {
-                ui.set_min_width(220.0);
-                let names: Vec<String> = self.presets.keys().cloned().collect();
-                if names.is_empty() {
-                    ui.label(RichText::new("还没有预设").size(10.0).color(SUB));
-                }
-                for name in names {
-                    ui.horizontal(|ui| {
-                        if ui.button(&name).clicked() {
-                            self.load_preset(&name);
-                            ui.close_menu();
-                        }
-                        if ui.small_button("×").clicked() {
-                            self.delete_preset(&name);
-                        }
-                    });
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.preset_name)
-                            .hint_text("预设名")
-                            .desired_width(120.0),
+
+            menu_section(ui, "选卡");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("最大重抽").size(12.0).color(INK));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let resp = ui.add_sized(
+                        [78.0, 24.0],
+                        egui::DragValue::new(&mut self.max_reroll)
+                            .range(0..=99)
+                            .speed(1.0)
+                            .suffix(" 次"),
                     );
-                    if ui.button("保存当前").clicked() {
-                        self.save_preset();
+                    if resp.changed() {
+                        save_settings(&Settings {
+                            max_reroll: self.max_reroll,
+                            preload_model: self.preload_model,
+                            skip_driver_prompt: self.skip_driver_prompt,
+                        });
                     }
                 });
             });
+            menu_hint(ui, "每轮最多重抽几次，0 表示不重抽");
+
+            menu_section(ui, "性能");
+            let mut preload = self.preload_model;
+            if toggle_row(ui, &mut preload, "启动时预加载模型") {
+                self.preload_model = preload;
+                save_settings(&Settings {
+                    max_reroll: self.max_reroll,
+                    preload_model: self.preload_model,
+                    skip_driver_prompt: self.skip_driver_prompt,
+                });
+                if preload {
+                    ybb::ort_ocr::preload(4);
+                } else {
+                    ybb::ort_ocr::clear_cache();
+                }
+            }
+            menu_hint(
+                ui,
+                if self.preload_model {
+                    "打开程序就加载，点开始时不用等"
+                } else {
+                    "只在选卡时加载，跑完立即释放"
+                },
+            );
+
+            menu_section(ui, "环境");
+            if ui
+                .button(RichText::new("安装 Interception 驱动").size(11.5))
+                .clicked()
+            {
+                self.driver_prompt = true;
+                self.driver_msg = None;
+                self.driver_done = false;
+                ui.close_menu();
+            }
+            menu_hint(ui, "没装的话游戏可能收不到按键");
+
+            menu_section(ui, "队列");
+            ui.menu_button(
+                RichText::new("队列预设    ›").size(12.0),
+                |ui| {
+                    ui.set_min_width(228.0);
+                    let names: Vec<String> = self.presets.keys().cloned().collect();
+                    if names.is_empty() {
+                        ui.label(RichText::new("还没有预设").size(10.5).color(SUB));
+                    }
+                    for name in names {
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new(&name).size(11.5)).clicked() {
+                                self.load_preset(&name);
+                                ui.close_menu();
+                            }
+                            if ui.small_button("×").clicked() {
+                                self.delete_preset(&name);
+                            }
+                        });
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.preset_name)
+                                .hint_text("预设名")
+                                .desired_width(126.0),
+                        );
+                        if ui.button("保存当前").clicked() {
+                            self.save_preset();
+                        }
+                    });
+                },
+            );
+
+            menu_section(ui, "日志");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if ui.small_button("复制日志").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.copy_log(&ctx);
+                    ui.close_menu();
+                }
+                if ui.small_button("导出日志").clicked() {
+                    self.export_log();
+                    ui.close_menu();
+                }
+                if ui.small_button("清空日志").clicked() {
+                    self.log.clear();
+                    ui.close_menu();
+                }
+            });
+
+            ui.add_space(2.0);
+            ui.separator();
+            ui.label(
+                RichText::new("YBB v1.2  ·  歪歪子")
+                    .size(9.5)
+                    .color(SUB),
+            );
         });
     }
 
@@ -655,9 +822,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("YBB").size(26.0).strong().color(ACCENT));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("v1.1").size(10.5).color(SUB));
+                ui.label(RichText::new("v1.2").size(10.5).color(SUB));
                 self.settings_menu(ui);
-                self.log_menu(ui);
             });
         });
         ui.label(
@@ -703,6 +869,191 @@ impl App {
             }
         });
     }
+    fn driver_prompt_ui(&mut self, ctx: &egui::Context) {
+        if !self.driver_prompt {
+            return;
+        }
+        let mut close = false;
+        // 背景压暗，突出弹窗
+        let screen = ctx.screen_rect();
+        egui::Area::new("driver_dim".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.allocate_rect(screen, egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(screen, 0.0, Color32::from_black_alpha(55));
+            });
+
+        egui::Window::new("driver_prompt")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0f32, LINE))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(Margin::same(16.0))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 8.0),
+                        blur: 24.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(45),
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(330.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("安装 Interception 驱动")
+                            .size(15.0)
+                            .strong()
+                            .color(INK),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("✕").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("检测到还没安装 Interception 驱动")
+                        .size(12.5)
+                        .strong()
+                        .color(INK),
+                );
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new(
+                        "它用于向游戏稳定地发送按键。不装也能用（自动退回 SendInput），但部分游戏可能不响应。",
+                    )
+                    .size(11.0)
+                    .color(SUB),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new("安装需要管理员权限，会弹 UAC；装完建议重启一次。")
+                        .size(11.0)
+                        .color(SUB),
+                );
+                ui.add_space(10.0);
+
+                let mut skip = self.skip_driver_prompt;
+                if ui
+                    .checkbox(&mut skip, RichText::new("不再提醒").size(10.5))
+                    .changed()
+                {
+                    self.skip_driver_prompt = skip;
+                    save_settings(&Settings {
+                        max_reroll: self.max_reroll,
+                        preload_model: self.preload_model,
+                        skip_driver_prompt: self.skip_driver_prompt,
+                    });
+                }
+
+                if let Some(msg) = &self.driver_msg {
+                    ui.add_space(8.0);
+                    egui::Frame::none()
+                        .fill(Color32::from_gray(248))
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::same(8.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(msg)
+                                    .size(10.5)
+                                    .color(if self.driver_done { OKC } else { WARN }),
+                            );
+                        });
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if self.driver_done {
+                        let done = egui::Button::new(
+                            RichText::new("完成")
+                                .size(12.0)
+                                .color(Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(ACCENT)
+                        .rounding(Rounding::same(6.0))
+                        .min_size(egui::vec2(80.0, 30.0));
+                        if ui.add(done).clicked() {
+                            self.driver_prompt = false;
+                        }
+                    } else {
+                        let install = egui::Button::new(
+                            RichText::new("立即安装")
+                                .size(12.0)
+                                .color(Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(ACCENT)
+                        .rounding(Rounding::same(6.0))
+                        .min_size(egui::vec2(92.0, 30.0));
+                        if ui.add(install).clicked() {
+                            self.install_driver();
+                        }
+                        let later = egui::Button::new(RichText::new("稍后").size(12.0))
+                            .rounding(Rounding::same(6.0))
+                            .min_size(egui::vec2(64.0, 30.0));
+                        if ui.add(later).clicked() {
+                            self.driver_prompt = false;
+                        }
+                    }
+                });
+            });
+        if close {
+            self.driver_prompt = false;
+        }
+    }
+
+    fn install_driver(&mut self) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let Some(dir) = ybb::assets::find(
+            "_interception/Interception/command line installer",
+            "install-interception.exe",
+        ) else {
+            self.driver_msg = Some(
+                "找不到安装器。请确认解压完整（_interception 目录要在 YBB 旁边）".into(),
+            );
+            return;
+        };
+        let exe = dir.join("install-interception.exe");
+        let file: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+        let params: Vec<u16> = "/install\0".encode_utf16().collect();
+        let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+        let cwd: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        self.driver_msg = Some("正在请求管理员权限…".into());
+        let ret = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                params.as_ptr(),
+                cwd.as_ptr(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if ret as isize > 32 {
+            self.driver_done = true;
+            self.driver_msg =
+                Some("安装程序已启动，请按提示完成；完成后重启电脑。".into());
+        } else {
+            self.driver_msg = Some(format!(
+                "无法启动安装程序（错误码 {}）。可能取消了 UAC。",
+                ret as isize
+            ));
+        }
+    }
+
 }
 
 impl eframe::App for App {
@@ -1017,6 +1368,8 @@ impl eframe::App for App {
                             });
                     });
             });
+
+        self.driver_prompt_ui(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
