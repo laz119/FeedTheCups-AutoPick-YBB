@@ -310,7 +310,7 @@ pub fn focus_index(
 /// 判稳阈值：静止画面实测差值 0.000，留一点余量给抗锯齿/编码噪声
 pub const STABLE_DIFF: f64 = 0.5;
 /// 最短稳定时间：快机器上帧间隔可能只有十几毫秒，必须连续不变够久才算稳定
-pub const STABLE_MS: u64 = 50;
+pub const STABLE_MS: u64 = 20;
 /// 重抽后判定「画面真的变了」的阈值
 pub const CHANGE_DIFF: f64 = 0.5;
 
@@ -393,30 +393,9 @@ fn settle_core(
     // 重抽和「复用上一帧」都可能碰到动画中间帧，卡名要像正常卡名才接受
     let require_plausible = baseline.is_some() || seeded;
 
-    // 快速路径：seed 是确认后 wait_changed 抓到的帧，直接读卡省一次截图。
-    // 引擎层会校验卡名是否和上一轮重复，重复则丢弃 seed 重新截图（防翻牌动画旧帧）。
-    if baseline.is_none() {
-        if let Some(seed_img) = seed.as_ref() {
-            let cards = match ort {
-                Some(o) => read_cards_ort(o, seed_img),
-                None => read_cards(t, seed_img, true),
-            };
-            let ok = cards.iter().all(|c| !c.is_empty()) && plausible(&cards);
-            if ok {
-                if let Some(focus) = focus_auto(t, seed_img, &cards, tpl) {
-                    return Ok(Look {
-                        cards,
-                        focus: Some(focus),
-                        settle_ms: start.elapsed().as_secs_f64() * 1000.0,
-                        shots: 0,
-                        frame: seed.unwrap(),
-                        auto_layout: false,
-                    });
-                }
-            }
-        }
-    }
-
+    // 不再从 seed 直接读卡：实测 seed 是翻牌动画帧，焦点气泡还没出现，
+    // 快路径几乎每轮都失败，白浪费一次 OCR，然后还是走正常判稳。
+    // seed 只作为判稳的上一帧基准（下面 prev = seed），不单独读卡。
     let mut tried_clear = false;
     let mut prev: Option<Image> = seed;
     loop {
@@ -621,7 +600,7 @@ pub fn settle_after_change(
     baseline: &Image,
     timeout_ms: u64,
 ) -> Result<Look, SettleFail> {
-    settle_core(ctrl, t, tpl, ort, clear, timeout_ms, Some(baseline), None, 3)
+    settle_core(ctrl, t, tpl, ort, clear, timeout_ms, Some(baseline), None, 1)
 }
 
 
@@ -641,6 +620,11 @@ pub fn name_rois_abs(img: &Image) -> [[i32; 4]; 3] {
 
 /// 等画面变化：8ms 轮询卡名带差，超过阈值就返回变化后的那一帧。
 /// 返回帧可以喂给下一轮 `settle_and_read_seeded`，省掉一次截图。
+/// 等画面相对 `prev` 发生变化，并且**稳定下来**再返回。
+///
+/// 翻牌动画第一帧就和 `prev` 不同了，但卡名可能还是旧的。如果直接返回这一帧，
+/// 下一轮的快路径会读到旧卡名（触发「卡名和上一轮相同」重读，白白多一次截图+OCR）。
+/// 所以这里检测到变化后继续等，直到连续两帧卡名带几乎不变（STABLE_DIFF）才返回。
 pub fn wait_changed(
     ctrl: &crate::maa::Controller,
     band: [i32; 4],
@@ -649,17 +633,44 @@ pub fn wait_changed(
     timeout_ms: u64,
 ) -> Option<Image> {
     let start = std::time::Instant::now();
+    let mut changed_img: Option<Image> = None;
+    let mut last: Option<Image> = None;
+    let mut stable_run = 0u32;
     loop {
         if start.elapsed().as_millis() as u64 > timeout_ms {
-            return None;
+            return changed_img;
         }
         std::thread::sleep(std::time::Duration::from_millis(8));
         let Ok(img) = ctrl.screencap() else {
             continue;
         };
-        if crate::fingerprint::band_diff(prev, &img, band) > threshold {
-            return Some(img);
+        // 阶段1：等画面相对 prev 发生明显变化
+        if changed_img.is_none() {
+            if crate::fingerprint::band_diff(prev, &img, band) > threshold {
+                changed_img = Some(img);
+                stable_run = 0;
+            }
+            continue;
         }
+        // 阶段2：变化后等画面真正稳定（wait_changed 用更严格的阈值，
+        // 避免动画慢速阶段两帧差 <0.5 被误判为稳定、提前返回）
+        const WAIT_STABLE_DIFF: f64 = 0.2;
+        if let Some(l) = &last {
+            if crate::fingerprint::band_diff(l, &img, band) < WAIT_STABLE_DIFF {
+                stable_run += 1;
+                if stable_run >= 2 {
+                    // 稳定了，但还要确认和 prev 不同（防动画视觉效果导致的假变化）
+                    if crate::fingerprint::band_diff(prev, &img, band) > threshold {
+                        return Some(img);
+                    }
+                    // 稳定帧和 prev 一样 = 假变化，重置继续等
+                    stable_run = 0;
+                }
+            } else {
+                stable_run = 0;
+            }
+        }
+        last = Some(img);
     }
 }
 
@@ -771,30 +782,26 @@ fn focus_by_template_scored(
     Some((best, score))
 }
 
-/// 焦点判定：**OCR 优先**，模板匹配只做兜底。
+/// 焦点判定：**模板优先**（~25ms），失败退回 OCR（~200ms）。
 ///
-/// 模板 `focus_template.png`（黑底白字「选择」）与真实游戏的白底黑字气泡
-/// 不匹配，低阈值下会在卡的深色区域误匹配出假焦点，导致推格起点错、选错卡。
-/// 所以这里先用 OCR 找「选择」气泡（实测能准确定位），OCR 失败才退回模板，
-/// 且模板阈值提到 0.85，宁可不判也不误判。
+/// 模板 `focus_template.png` 是从实际游戏画面裁的白底黑字「选择」气泡，
+/// 与真实 UI 一致，多帧实测模板和 OCR 判定结果完全一致。
+/// 模板阈值 0.7：足够拦住误匹配，又不会因为轻微抗锯齿/缩放漏判。
 pub fn focus_auto(
     t: &Tasker,
     img: &Image,
     cards: &[CardSlot],
     tpl: Option<&crate::bubble::Bubble>,
 ) -> Option<usize> {
-    if let Some(i) = focus_index(t, img, cards, true).0 {
-        return Some(i);
-    }
     if let Some(tpl) = tpl {
-        if let Some(i) = focus_by_template(img, cards, tpl, 0.85) {
+        if let Some(i) = focus_by_template(img, cards, tpl, 0.7) {
             return Some(i);
         }
-        if let Some((i, _)) = focus_global_scored(img, cards, tpl, 0.85) {
+        if let Some((i, _)) = focus_global_scored(img, cards, tpl, 0.7) {
             return Some(i);
         }
     }
-    None
+    focus_index(t, img, cards, true).0
 }
 
 /// 自动布局兜底：在整块卡区里找「选择」气泡，不限定窄带。

@@ -57,6 +57,9 @@ pub struct Config {
     pub use_interception: bool,
     /// 键盘 还是 虚拟手柄
     pub input: input::InputMode,
+    /// true = 复用预加载的模型（GUI 启动时已加载）
+    /// false = 本次跑完就释放（只在选卡时开启）
+    pub preload_model: bool,
 }
 
 /// 跑完整个队列。`emit` 会在工作线程里被调用，GUI 用它更新界面。
@@ -182,13 +185,25 @@ fn run_inner(
     let use_maa = std::env::var("YBB_OCR")
         .map(|v| v.eq_ignore_ascii_case("maa"))
         .unwrap_or(false);
-    let ort = if use_maa {
+    let ort: Option<std::sync::Arc<crate::ort_ocr::OrtOcr>> = if use_maa {
         log(Level::Info, "OCR: MAA（YBB_OCR=maa）".into());
         None
     } else {
-        match crate::ort_ocr::OrtOcr::from_assets(tune.ort_threads) {
+        let r = if cfg.preload_model {
+            crate::ort_ocr::cached(tune.ort_threads)
+        } else {
+            crate::ort_ocr::OrtOcr::from_assets(tune.ort_threads).map(std::sync::Arc::new)
+        };
+        match r {
             Ok(o) => {
-                log(Level::Info, "OCR: ONNX Runtime 三张批量（4 线程）".into());
+                log(
+                    Level::Info,
+                    if cfg.preload_model {
+                        "OCR: ONNX Runtime 三张批量（复用预加载）".into()
+                    } else {
+                        "OCR: ONNX Runtime 三张批量（本次加载）".into()
+                    },
+                );
                 Some(o)
             }
             Err(e) => {
@@ -199,7 +214,7 @@ fn run_inner(
     };
 
     // 预热一次，避免首轮把模型初始化的时间算进去
-    let _ = picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), ort.as_ref(), Some(&clear_cards), tune.settle_timeout_ms);
+    let _ = picker::settle_and_read(&ctrl, &tasker, tpl.as_ref(), ort.as_deref(), Some(&clear_cards), tune.settle_timeout_ms);
 
     let total = cfg.queue.len();
     if cfg.start_index >= total {
@@ -243,7 +258,7 @@ fn run_inner(
                             &ctrl,
                             &tasker,
                             tpl.as_ref(),
-                            ort.as_ref(),
+                            ort.as_deref(),
                             Some(&clear_cards),
                             tune.settle_timeout_ms,
                             seed.take(),
@@ -358,7 +373,7 @@ fn run_inner(
                         &ctrl,
                         &tasker,
                         tpl.as_ref(),
-                        ort.as_ref(),
+                        ort.as_deref(),
                         Some(&clear_cards),
                         &baseline,
                         tune.reroll_timeout_ms,

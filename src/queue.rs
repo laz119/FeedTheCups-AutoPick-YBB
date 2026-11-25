@@ -16,7 +16,12 @@ fn is_name_char(c: char) -> bool {
 }
 
 /// 把用户贴进来的一坨文本切成有序卡名列表。
+///
+/// 先做 NFKC 归一化：中文输入法的全角 `＋`（U+FF0B）会转成半角 `+`（U+002B），
+/// 否则 `is_name_char` 不认识全角加号，`气球＋` 会被拆成 `气球`，丢失升级标记。
 pub fn parse_queue(text: &str) -> Vec<String> {
+    use unicode_normalization::UnicodeNormalization;
+    let text: String = text.nfkc().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
 

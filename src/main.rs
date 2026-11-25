@@ -48,6 +48,7 @@ macro_rules! logln {
 }
 
 fn main() {
+    ybb::assets::chdir_to_app();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("help");
 
@@ -69,7 +70,7 @@ fn main() {
         "parse" => parse_cmd(&args[1..]),
         "selftest" => selftest(),
         "-V" | "--version" | "version" => {
-            println!("YBB v1.1 —— 杯杯倒满 地铁自动选卡");
+            println!("YBB v1.2 —— 杯杯倒满 地铁自动选卡");
             println!("作者: 歪歪子  <1443423104@qq.com>");
             println!("开源协议: MIT（可自由复制修改，保留版权声明即可）");
             println!("查看完整协议: ybb-cli.exe --license");
@@ -230,6 +231,7 @@ fn run_cmd(rest: &[String]) {
         max_reroll,
         use_interception: use_icpt,
         input: input_mode,
+        preload_model: false,
     };
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     ybb::engine::run(

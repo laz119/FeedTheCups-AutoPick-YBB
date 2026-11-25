@@ -39,6 +39,37 @@ fn load_env(dll: &Path) -> Result<Arc<ort::environment::Environment>, String> {
     Ok(env)
 }
 
+/// 进程级 ORT 会话缓存：GUI 打开时可预加载，点开始时直接复用。
+static CACHE: OnceLock<Mutex<Option<Arc<OrtOcr>>>> = OnceLock::new();
+
+/// 取缓存会话；没有就加载一次并放进缓存。
+pub fn cached(threads: usize) -> Result<Arc<OrtOcr>, String> {
+    let slot = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().map_err(|e| e.to_string())?;
+    if let Some(o) = guard.as_ref() {
+        return Ok(o.clone());
+    }
+    let o = Arc::new(OrtOcr::from_assets(threads)?);
+    *guard = Some(o.clone());
+    Ok(o)
+}
+
+/// 后台预加载（GUI 启动时调用，不阻塞界面）。
+pub fn preload(threads: usize) {
+    std::thread::spawn(move || {
+        let _ = cached(threads);
+    });
+}
+
+/// 释放缓存会话；正在跑的任务持有的 Arc 会等任务结束后自然释放。
+pub fn clear_cache() {
+    if let Some(slot) = CACHE.get() {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = None;
+        }
+    }
+}
+
 impl OrtOcr {
     /// 按 YBB 的资源目录布局找 dll/model/keys。
     pub fn from_assets(threads: usize) -> Result<Self, String> {
